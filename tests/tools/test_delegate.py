@@ -1700,6 +1700,92 @@ class TestDispatchDelegateTask(unittest.TestCase):
             "codex-thread-task",
         )
 
+    def test_model_dispatch_forwards_managed_native_seat(self):
+        """A native seat named in the model's tool call reaches delegate_task."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "test",
+                    "runtime": "claude-code",
+                    "native": {
+                        "model": "claude-opus-4-6",
+                        "effort": "high",
+                        "approval_mode": "auto",
+                    },
+                    "tasks": [
+                        {"goal": "nested", "runtime": "codex",
+                         "native": {"effort": "xhigh"}},
+                    ],
+                },
+            )
+
+        self.assertEqual(
+            captured.get("native"),
+            {"model": "claude-opus-4-6", "effort": "high", "approval_mode": "auto"},
+        )
+        self.assertEqual(captured["tasks"][0].get("native"), {"effort": "xhigh"})
+
+    def test_model_dispatch_forwards_every_schema_backed_param(self):
+        """Every schema param delegate_task accepts survives the intercept.
+
+        'background' is excluded — the dispatcher deliberately owns it.
+        """
+        import inspect
+
+        import run_agent
+        import tools.delegate_tool as delegate_tool
+
+        model_values = {
+            "goal": "primary goal",
+            "context": "background context",
+            "tasks": [{"goal": "nested", "runtime": "codex"}],
+            "role": "orchestrator",
+            "runtime": "claude-code",
+            "resume_session_id": "claude-session-top",
+            "native": {"model": "claude-opus-4-6", "approval_mode": "auto"},
+            "output_schema": {"type": "object"},
+            "action": "respond",
+            "subagent_id": "child-1",
+            "message": "focus on Y",
+            "request_id": "req-1",
+            "answers": {"q1": ["yes"]},
+        }
+        accepted = set(inspect.signature(delegate_tool.delegate_task).parameters)
+        forwardable = (
+            set(DELEGATE_TASK_SCHEMA["parameters"]["properties"]) & accepted
+        ) - {"background"}
+        self.assertEqual(
+            forwardable,
+            set(model_values),
+            "schema/signature gained a delegate param this test does not cover",
+        )
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(parent, dict(model_values))
+
+        for field, value in model_values.items():
+            with self.subTest(field=field):
+                self.assertIn(field, captured)
+                self.assertEqual(captured[field], value)
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

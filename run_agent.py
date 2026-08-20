@@ -8419,10 +8419,14 @@ class AIAgent:
             role=function_args.get("role"),
             runtime=function_args.get("runtime"),
             resume_session_id=function_args.get("resume_session_id"),
+            native=function_args.get("native"),
             background=(not _is_subagent),
+            output_schema=function_args.get("output_schema"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            request_id=function_args.get("request_id"),
+            answers=function_args.get("answers"),
             parent_agent=self,
         )
 
