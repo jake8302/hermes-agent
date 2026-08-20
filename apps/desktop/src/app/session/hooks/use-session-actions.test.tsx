@@ -14,6 +14,7 @@ import {
   type SessionResumeResponse
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
@@ -699,6 +700,73 @@ function ResumeTimerHarness({
 
   return null
 }
+
+describe('session.resume pending clarify restoration', () => {
+  afterEach(() => {
+    cleanup()
+    clearClarifyRequest()
+    setActiveSessionId(null)
+    setMessages([])
+    setSessions([])
+    vi.restoreAllMocks()
+  })
+
+  it('restores a pending batch clarify form with its locked answers', async () => {
+    const resumed = {
+      info: {},
+      message_count: 0,
+      messages: [],
+      pending_clarify: {
+        answers: { q0: 'Coffee' },
+        questions: [
+          { choices: ['Coffee', 'Tea'], qid: 'q0', question: 'Pick a drink?' },
+          { choices: ['Morning', 'Night'], qid: 'q1', question: 'Pick a time?' }
+        ],
+        request_id: 'req-batch'
+      },
+      resumed: 'stored-1',
+      session_id: 'runtime-1',
+      session_key: 'stored-1'
+    } satisfies SessionResumeResponse
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-1' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return resumed as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    let resumedState: ClientSessionState | undefined
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onStateUpdate={(_sessionId, state) => (resumedState = state)}
+        requestGateway={requestGateway}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-1', true)
+
+    expect($clarifyRequests.get()['runtime-1']).toEqual({
+      choices: null,
+      lockedAnswers: { q0: 'Coffee' },
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['Coffee', 'Tea'], multiSelect: false, qid: 'q0', question: 'Pick a drink?' },
+        { choices: ['Morning', 'Night'], multiSelect: false, qid: 'q1', question: 'Pick a time?' }
+      ],
+      requestId: 'req-batch',
+      sessionId: 'runtime-1'
+    })
+    expect(resumedState?.needsInput).toBe(true)
+  })
+})
 
 describe('resumeSession failure recovery', () => {
   afterEach(() => {
