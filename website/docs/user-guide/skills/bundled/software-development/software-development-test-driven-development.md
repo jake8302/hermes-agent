@@ -340,6 +340,7 @@ When dispatching subagents for implementation, enforce TDD in the goal:
 
 ```python
 delegate_task(
+    runtime="hermes",
     goal="Implement [feature] using strict TDD",
     context="""
     Follow test-driven-development skill:

@@ -82,6 +82,30 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_exposes_allowlisted_native_runtimes(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        task_items = props["tasks"]["items"]
+
+        self.assertEqual(
+            props["runtime"]["enum"],
+            ["hermes", "claude-code", "codex"],
+        )
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["runtime"]["enum"],
+            ["hermes", "claude-code", "codex"],
+        )
+        self.assertIn("runtime", DELEGATE_TASK_SCHEMA["parameters"]["required"])
+        self.assertNotIn("runtime", task_items["required"])
+
+    def test_schema_exposes_opaque_native_resume_session_id(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        task_props = props["tasks"]["items"]["properties"]
+
+        self.assertEqual(props["resume_session_id"]["type"], "string")
+        self.assertEqual(task_props["resume_session_id"]["type"], "string")
+        self.assertNotIn("command", props)
+        self.assertNotIn("args", props)
+
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
         contract that exists nowhere else in the schema (keyword-level, not
@@ -93,6 +117,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertLessEqual(len(desc), 2200)
         # Contracts only the top-level text carries:
         for keyword in (
+            "runtime='claude-code'",  # explicit native Claude routing
+            "runtime='codex'",        # explicit native Codex routing
+            "Pass 'hermes'",          # explicit default selection
+            "Ignored for control actions",
+            "standalone claude",      # managed-vs-CLI precedence
             "background",          # async semantics
             "wait or poll",        # no-poll rule
             "execute_code",        # mechanical-work routing
@@ -107,6 +136,7 @@ class TestDelegateRequirements(unittest.TestCase):
             "delegation.provider", # model inheritance / pinning
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        self.assertNotIn("Omit runtime", desc)
 
     def test_dynamic_limits_moved_to_param_descriptions(self):
         """Concurrency and nesting ceilings must reach the model through the
@@ -287,6 +317,242 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    def test_codex_runtime_routes_public_spawn_to_app_server(self):
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._resolve_workspace_hint",
+                return_value="/tmp/native-codex-child",
+            ),
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use the native Codex worker",
+                    runtime="codex",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["summary"], "ok")
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "openai-codex")
+        self.assertEqual(kwargs["api_mode"], "codex_app_server")
+        self.assertEqual(mock_child._delegate_runtime, "codex")
+        self.assertEqual(mock_child.session_cwd, "/tmp/native-codex-child")
+
+    def test_claude_runtime_routes_public_spawn_to_agent_sdk(self):
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._resolve_workspace_hint",
+                return_value="/tmp/native-claude-child",
+            ),
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use the native Claude worker",
+                    runtime="claude-code",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["summary"], "ok")
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "claude-code")
+        self.assertEqual(kwargs["api_mode"], "claude_agent_sdk")
+        self.assertEqual(kwargs["model"], "claude-code")
+        self.assertEqual(mock_child._delegate_runtime, "claude-code")
+        self.assertEqual(mock_child.session_cwd, "/tmp/native-claude-child")
+        self.assertEqual(
+            mock_child._delegate_approval_callback("cmd", "description"),
+            "deny",
+        )
+
+    def test_native_runtime_accepts_opaque_resume_session_id(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "resumed",
+                "completed": True,
+                "api_calls": 1,
+                "native_session_id": "claude-session-42",
+                "approval_denials": [
+                    {
+                        "provider": "claude-code",
+                        "kind": "Edit",
+                        "reason": "Hermes approval policy denied the request",
+                        "command": "secret-looking command must not leak",
+                    }
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Continue the native task",
+                    runtime="claude-code",
+                    resume_session_id="claude-session-42",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["summary"], "resumed")
+        self.assertEqual(
+            result["results"][0]["native_session_id"],
+            "claude-session-42",
+        )
+        self.assertEqual(result["results"][0]["runtime"], "claude-code")
+        self.assertEqual(result["results"][0]["approval_denials"][0]["kind"], "Edit")
+        self.assertNotIn("secret-looking", str(result["results"][0]))
+        self.assertIsNone(mock_child._delegate_input_callback)
+        self.assertEqual(mock_child._native_resume_session_id, "claude-session-42")
+
+    def test_background_native_runtime_installs_input_callback(self):
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.async_delegation.dispatch_async_delegation_batch",
+                return_value={
+                    "status": "dispatched",
+                    "delegation_id": "deleg-input-callback",
+                },
+            ),
+        ):
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+            result = json.loads(
+                delegate_task(
+                    goal="Run a native background task",
+                    runtime="claude-code",
+                    parent_agent=parent,
+                    background=True,
+                )
+            )
+
+        self.assertEqual(result["status"], "dispatched")
+        self.assertIn("_delegate_input_callback", mock_child.__dict__)
+        self.assertTrue(callable(mock_child._delegate_input_callback))
+
+    def test_native_runtime_uses_created_child_worktree_as_cwd(self):
+        parent = _make_mock_parent(depth=0)
+        isolated = "/tmp/native-child-worktree"
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._resolve_workspace_hint",
+                return_value="/tmp/parent-worktree",
+            ),
+            patch("tools.delegate_tool._get_worktree_isolation", return_value=True),
+            patch(
+                "tools.subagent_worktree.create_subagent_worktree",
+                return_value={"path": isolated},
+            ),
+            patch(
+                "tools.subagent_worktree.finalize_subagent_worktree",
+                return_value={"path": isolated, "pruned": True},
+            ),
+        ):
+            mock_child = MagicMock()
+
+            def run_child(*_args, **_kwargs):
+                self.assertEqual(mock_child.session_cwd, isolated)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+
+            mock_child.run_conversation.side_effect = run_child
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Work in the isolated tree",
+                    runtime="codex",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["summary"], "done")
+
+    def test_native_runtime_inherits_parent_live_session_cwd(self):
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-live-cwd"
+        mock_child = MagicMock()
+
+        def assert_live_cwd(*_args, **_kwargs):
+            self.assertEqual(mock_child.session_cwd, "/tmp/parent-live-cwd")
+            return {
+                "final_response": "live cwd",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+        mock_child.run_conversation.side_effect = assert_live_cwd
+        with (
+            patch("run_agent.AIAgent", return_value=mock_child),
+            patch(
+                "tools.delegate_tool._resolve_workspace_hint",
+                return_value="/tmp/stale-workspace-hint",
+            ),
+            patch(
+                "tools.terminal_tool.get_session_cwd",
+                return_value="/tmp/parent-live-cwd",
+            ),
+            patch("tools.delegate_tool._get_worktree_isolation", return_value=False),
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Use the live parent cwd",
+                    runtime="codex",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["summary"], "live cwd")
+
+    def test_batch_rejects_shared_top_level_resume_session_id(self):
+        parent = _make_mock_parent(depth=0)
+
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "first", "runtime": "claude-code"},
+                    {"goal": "second", "runtime": "claude-code"},
+                ],
+                resume_session_id="claude-session-shared",
+                parent_agent=parent,
+            )
+        )
+
+        self.assertIn("per task", result["error"])
 
     def test_child_gets_dedicated_session_db_not_parents_handle(self):
         """#81267: children must not share the parent's SessionDB object.
@@ -1038,6 +1304,45 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_run_single_child_projects_managed_native_metadata(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_runtime = "claude-code"
+        child._delegate_native_config = {
+            "model": "claude-fable-5",
+            "effort": "xhigh",
+            "approval_mode": "auto",
+        }
+        child.model = None
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+            "native_session_id": "claude-session-42",
+            "native_model_requested": "claude-fable-5",
+            "native_effort_requested": "xhigh",
+            "native_approval_mode_requested": "auto",
+            "native_model_resolved": "claude-fable-5",
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Review exactly",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["runtime"], "claude-code")
+        self.assertEqual(result["native_session_id"], "claude-session-42")
+        self.assertEqual(result["native_model_requested"], "claude-fable-5")
+        self.assertEqual(result["native_effort_requested"], "xhigh")
+        self.assertEqual(result["native_approval_mode_requested"], "auto")
+        self.assertEqual(result["native_model_resolved"], "claude-fable-5")
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 
@@ -1366,11 +1671,15 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "runtime": "claude-code",
+                    "resume_session_id": "claude-session-top",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
                         {
                             "goal": "nested",
+                            "runtime": "codex",
+                            "resume_session_id": "codex-thread-task",
                             "acp_command": "codex",
                             "acp_args": ["--acp"],
                         },
@@ -1381,8 +1690,15 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["runtime"], "claude-code")
+        self.assertEqual(captured["resume_session_id"], "claude-session-top")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+        self.assertEqual(captured["tasks"][0]["runtime"], "codex")
+        self.assertEqual(
+            captured["tasks"][0]["resume_session_id"],
+            "codex-thread-task",
+        )
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -1567,6 +1883,17 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", task_props)
         self.assertNotIn("acp_args", task_props)
+
+    def test_schema_exposes_input_response_action(self):
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("respond", props["action"]["enum"])
+        self.assertEqual(props["request_id"]["type"], "string")
+        self.assertEqual(
+            props["answers"]["additionalProperties"]["items"]["type"],
+            "string",
+        )
 
 
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".

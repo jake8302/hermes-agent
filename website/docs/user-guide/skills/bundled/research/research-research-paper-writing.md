@@ -1432,14 +1432,14 @@ terminal("ps aux | grep <pattern>")
 
 **Parallel section drafting** (using delegation):
 ```
-delegate_task("Draft the Methods section based on these experiment scripts and configs. 
+delegate_task(runtime="hermes", goal="Draft the Methods section based on these experiment scripts and configs.
   Include: pseudocode, all hyperparameters, architectural details sufficient for 
   reproduction. Write in LaTeX using the neurips2025 template conventions.")
 
-delegate_task("Draft the Related Work section. Use web_search and web_extract to 
+delegate_task(runtime="hermes", goal="Draft the Related Work section. Use web_search and web_extract to
   find papers. Verify every citation via Semantic Scholar. Group by methodology.")
 
-delegate_task("Draft the Experiments section. Read all result files in results/. 
+delegate_task(runtime="hermes", goal="Draft the Experiments section. Read all result files in results/.
   State which claim each experiment supports. Include error bars and significance.")
 ```
 

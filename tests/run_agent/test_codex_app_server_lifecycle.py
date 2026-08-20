@@ -7,6 +7,7 @@ the app-server child process survived until interpreter exit.
 """
 
 import threading
+from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
 
@@ -20,6 +21,10 @@ class _FakeCodexSession:
         self.close_calls += 1
         if self._raises:
             raise RuntimeError("app-server already dead")
+
+    def request_steer(self, text: str) -> bool:
+        self.steer_text = text
+        return True
 
 
 def _bare_agent(session_id: str) -> AIAgent:
@@ -49,6 +54,40 @@ def test_agent_close_releases_codex_app_server_session(monkeypatch):
     assert codex_session.close_calls == 1
     assert agent._codex_session is None
     assert agent._session_messages == []
+
+
+def test_agent_steer_reaches_active_codex_app_server_session():
+    agent = AIAgent.__new__(AIAgent)
+    agent.api_mode = "codex_app_server"
+    codex_session = _FakeCodexSession()
+    agent._codex_session = codex_session
+
+    assert agent.steer("focus on the parser") is True
+    assert codex_session.steer_text == "focus on the parser"
+
+
+def test_agent_stamps_resume_id_on_codex_app_server_session():
+    from agent.codex_runtime import run_codex_app_server_turn
+
+    agent = MagicMock()
+    agent._codex_session = None
+    agent.session_cwd = "/tmp/native-codex-resume"
+    agent._native_resume_session_id = "thread-existing-42"
+    agent._interrupt_requested = False
+
+    with patch(
+        "agent.transports.codex_app_server_session.CodexAppServerSession"
+    ) as Session:
+        Session.return_value.run_turn.side_effect = RuntimeError("stop after init")
+        run_codex_app_server_turn(
+            agent,
+            user_message="resume",
+            original_user_message="resume",
+            messages=[],
+            effective_task_id="task-1",
+        )
+
+    assert Session.call_args.kwargs["resume_thread_id"] == "thread-existing-42"
 
 
 def test_close_clears_reference_even_when_session_close_raises(monkeypatch):

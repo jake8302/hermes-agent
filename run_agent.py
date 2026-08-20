@@ -3311,6 +3311,22 @@ class AIAgent:
                         exc_info=True,
                     )
 
+        if getattr(self, "api_mode", None) == "claude_agent_sdk":
+            _claude_session = getattr(self, "_claude_sdk_session", None)
+            _request_interrupt = getattr(
+                _claude_session,
+                "request_interrupt",
+                None,
+            )
+            if callable(_request_interrupt):
+                try:
+                    _request_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to interrupt Claude Agent SDK turn",
+                        exc_info=True,
+                    )
+
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -3453,6 +3469,31 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            session = getattr(self, "_codex_session", None)
+            request_steer = getattr(session, "request_steer", None)
+            if callable(request_steer):
+                try:
+                    return bool(request_steer(cleaned))
+                except Exception:
+                    logger.debug(
+                        "Codex App Server steer request failed",
+                        exc_info=True,
+                    )
+            return False
+        if getattr(self, "api_mode", None) == "claude_agent_sdk":
+            _claude_session = getattr(self, "_claude_sdk_session", None)
+            _native_steer = getattr(_claude_session, "request_steer", None)
+            if not callable(_native_steer):
+                return False
+            try:
+                return bool(_native_steer(cleaned))
+            except Exception:
+                logger.debug(
+                    "Failed to steer Claude Agent SDK turn",
+                    exc_info=True,
+                )
+                return False
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -4620,6 +4661,15 @@ class AIAgent:
             if codex_session is not None:
                 self._codex_session = None
                 codex_session.close()
+        except Exception:
+            pass
+
+        # 6d. Close the Claude SDK client and its event-loop thread.
+        try:
+            claude_session = getattr(self, "_claude_sdk_session", None)
+            if claude_session is not None:
+                self._claude_sdk_session = None
+                claude_session.close()
         except Exception:
             pass
 
@@ -8367,6 +8417,8 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            runtime=function_args.get("runtime"),
+            resume_session_id=function_args.get("resume_session_id"),
             background=(not _is_subagent),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
@@ -8961,6 +9013,27 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+    def _run_claude_agent_sdk_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forwarder for the native Claude Agent SDK runtime."""
+        from agent.claude_agent_sdk_runtime import run_claude_agent_sdk_turn
+
+        return run_claude_agent_sdk_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
 
 def main(
     query: str = None,

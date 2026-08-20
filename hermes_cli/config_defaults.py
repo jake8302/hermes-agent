@@ -1951,6 +1951,11 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Provider-native classifier approval modes (Claude `auto`, Codex
+        # `approve_for_me`) can resolve requests before Hermes' worker-thread
+        # callback sees them. Keep this operator-owned gate off by default so
+        # a model cannot escalate the default-deny delegation posture.
+        "native_classifier_approvals": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

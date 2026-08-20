@@ -1,7 +1,7 @@
 ---
 name: requesting-code-review
 description: "Pre-commit review: security scan, quality gates, auto-fix."
-version: 2.0.0
+version: 2.0.1
 author: Hermes Agent (adapted from obra/superpowers + MorAlekss)
 license: MIT
 platforms: [linux, macos, windows]
@@ -126,11 +126,18 @@ Quick scan before dispatching the reviewer:
 
 Call `delegate_task` directly — it is NOT available inside execute_code or scripts.
 
+Preserve an explicit provider-runtime request: use `runtime="claude-code"` for
+a native Claude Code reviewer or `runtime="codex"` for a native Codex reviewer.
+Otherwise use `runtime="hermes"` for the default Hermes child. Never replace a
+requested managed native reviewer with a standalone `claude` or `codex`
+terminal command.
+
 The reviewer gets ONLY the diff and static scan results. No shared context with
 the implementer. Fail-closed: unparseable response = fail.
 
 ```python
 delegate_task(
+    runtime="hermes",
     goal="""You are an independent code reviewer. You have no context about how
 these changes were made. Review the git diff and return ONLY valid JSON.
 
@@ -200,6 +207,7 @@ It fixes ONLY the reported issues:
 
 ```python
 delegate_task(
+    runtime="hermes",
     goal="""You are a code fix agent. Fix ONLY the specific issues listed below.
 Do NOT refactor, rename, or change anything else. Do NOT add features.
 

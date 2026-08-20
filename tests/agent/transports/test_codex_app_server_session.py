@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from unittest.mock import patch
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -37,10 +37,12 @@ class FakeClient:
         self._closed = False
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
-        self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self._request_handler: Optional[Callable[[str, dict], dict]] = None
+        self.initialize_kwargs: dict[str, Any] = {}
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
+        self.initialize_kwargs = dict(kwargs)
         self._initialized = True
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
@@ -123,6 +125,162 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
         cwd="/tmp",
         client_factory=lambda **kw: client,
         **kwargs,
+    )
+
+
+def test_thread_start_carries_developer_instructions():
+    client = FakeClient()
+    session = make_session(
+        client,
+        developer_instructions="HERMES_DELEGATION_CONTEXT",
+    )
+
+    session.ensure_started()
+
+    method, params = client.requests[0]
+    assert method == "thread/start"
+    assert params["developerInstructions"] == "HERMES_DELEGATION_CONTEXT"
+    assert session.thread_id == "thread-fake-001"
+
+
+def test_native_seat_and_auto_reviewer_are_sent_as_app_server_fields():
+    client = FakeClient()
+
+    def handle_request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {"id": "thread-native-seat"},
+                "model": "gpt-5.1-codex-max",
+                "reasoningEffort": "xhigh",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-native-seat"}}
+        return {}
+
+    client._request_handler = handle_request
+    client.queue_notification(
+        "turn/completed",
+        threadId="thread-native-seat",
+        turn={"id": "turn-native-seat", "status": "completed", "error": None},
+    )
+    session = make_session(
+        client,
+        model="gpt-5.1-codex-max",
+        effort="xhigh",
+        approval_policy="on-request",
+        approvals_reviewer="auto_review",
+    )
+
+    result = session.run_turn("work", turn_timeout=2.0)
+
+    thread_method, thread_params = client.requests[0]
+    assert thread_method == "thread/start"
+    assert thread_params["model"] == "gpt-5.1-codex-max"
+    assert thread_params["approvalPolicy"] == "on-request"
+    assert thread_params["approvalsReviewer"] == "auto_review"
+    turn_method, turn_params = client.requests[1]
+    assert turn_method == "turn/start"
+    assert turn_params["model"] == "gpt-5.1-codex-max"
+    assert turn_params["effort"] == "xhigh"
+    assert turn_params["approvalPolicy"] == "on-request"
+    assert turn_params["approvalsReviewer"] == "auto_review"
+    assert result.thread_id == "thread-native-seat"
+    assert session.resolved_model == "gpt-5.1-codex-max"
+    assert session.resolved_effort is None
+    assert session.resolved_approval_policy == "on-request"
+    assert session.resolved_approvals_reviewer == "auto_review"
+
+
+def test_omitted_native_config_keeps_codex_provider_defaults():
+    client = FakeClient()
+
+    def handle_request(method, _params):
+        if method == "thread/start":
+            return {
+                "thread": {"id": "thread-provider-defaults"},
+                "model": "provider-default-model",
+                "reasoningEffort": "medium",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-provider-defaults"}}
+        return {}
+
+    client._request_handler = handle_request
+    client.queue_notification(
+        "turn/completed",
+        threadId="thread-provider-defaults",
+        turn={"id": "turn-provider-defaults", "status": "completed", "error": None},
+    )
+    session = make_session(client)
+
+    session.run_turn("use provider defaults", turn_timeout=2.0)
+
+    thread_method, thread_params = client.requests[0]
+    assert thread_method == "thread/start"
+    assert not {
+        "model",
+        "effort",
+        "approvalPolicy",
+        "approvalsReviewer",
+    } & thread_params.keys()
+    turn_method, turn_params = client.requests[1]
+    assert turn_method == "turn/start"
+    assert not {
+        "model",
+        "effort",
+        "approvalPolicy",
+        "approvalsReviewer",
+    } & turn_params.keys()
+    assert session.resolved_model == "provider-default-model"
+    assert session.resolved_effort == "medium"
+    assert session.resolved_approval_policy == "on-request"
+    assert session.resolved_approvals_reviewer == "user"
+
+
+def test_thread_resume_refreshes_developer_instructions():
+    client = FakeClient()
+    client._request_handler = lambda method, params: (
+        {"thread": {"id": "thread-existing-42"}}
+        if method == "thread/resume"
+        else {}
+    )
+    session = make_session(
+        client,
+        resume_thread_id="thread-existing-42",
+        developer_instructions="HERMES_RESUME_CONTEXT",
+        model="gpt-5.1-codex-max",
+        effort="xhigh",
+        approval_policy="on-request",
+        approvals_reviewer="auto_review",
+    )
+
+    session.ensure_started()
+
+    method, params = client.requests[0]
+    assert method == "thread/resume"
+    assert params["developerInstructions"] == "HERMES_RESUME_CONTEXT"
+    assert params["model"] == "gpt-5.1-codex-max"
+    assert params["approvalPolicy"] == "on-request"
+    assert params["approvalsReviewer"] == "auto_review"
+
+
+def test_ensure_started_resumes_existing_thread():
+    client = FakeClient()
+    client._request_handler = lambda method, params: (
+        {"thread": {"id": "thread-existing-42"}}
+        if method == "thread/resume"
+        else {}
+    )
+    session = make_session(client, resume_thread_id="thread-existing-42")
+
+    assert session.ensure_started() == "thread-existing-42"
+    assert client.requests[-1] == (
+        "thread/resume",
+        {"threadId": "thread-existing-42", "cwd": "/tmp"},
     )
 
 
@@ -209,6 +367,25 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_none_turn_timeout_disables_transport_deadline(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("work", turn_timeout=None)
+
+        assert result.final_text == "done"
+        assert result.error is None
+
 
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
@@ -276,6 +453,192 @@ class TestRunTurn:
         assert result.final_text == "parent after approval"
         assert result.projected_messages == [
             {"role": "assistant", "content": "parent after approval"}
+        ]
+
+    def test_denied_exec_approval_is_reported_without_command_text(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="secret-looking command must not leak",
+            cwd="/tmp",
+        )
+        original_respond = client.respond
+
+        def respond_and_finish(request_id, result):
+            original_respond(request_id, result)
+            client.queue_notification(
+                "item/completed",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                item={"type": "agentMessage", "id": "m1", "text": "blocked"},
+            )
+            client.queue_notification(
+                "turn/completed",
+                threadId="thread-fake-001",
+                turn={"id": "turn-fake-001", "status": "completed", "error": None},
+            )
+
+        client.respond = respond_and_finish
+        result = make_session(client).run_turn("work", turn_timeout=2.0)
+
+        assert client.responses == [("approval-1", {"decision": "decline"})]
+        assert result.approval_denials == [
+            {
+                "provider": "codex",
+                "kind": "command",
+                "reason": "Hermes approval policy denied the request",
+            }
+        ]
+        assert "secret-looking" not in str(result.approval_denials)
+
+    def test_request_user_input_uses_sanitized_callback_and_exact_answer_shape(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/tool/requestUserInput",
+            request_id="question-1",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            itemId="item-question-1",
+            isBlocking=True,
+            questions=[
+                {
+                    "id": "framework",
+                    "header": "Framework",
+                    "question": "Which framework?",
+                    "options": [
+                        {"label": "React", "description": "Use React"},
+                        {"label": "Vue", "description": "Use Vue"},
+                    ],
+                    "isSecret": False,
+                    "unknown": "must not leak",
+                }
+            ],
+        )
+        requests = []
+        original_respond = client.respond
+
+        def answer(request):
+            requests.append(request)
+            return {"framework": ["React"]}
+
+        def respond_and_finish(request_id, result):
+            original_respond(request_id, result)
+            client.queue_notification(
+                "item/completed",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                item={"type": "agentMessage", "id": "m1", "text": "continued"},
+            )
+            client.queue_notification(
+                "turn/completed",
+                threadId="thread-fake-001",
+                turn={"id": "turn-fake-001", "status": "completed", "error": None},
+            )
+
+        client.respond = respond_and_finish
+        session = make_session(client, input_callback=answer)
+        result = session.run_turn("ask if needed", turn_timeout=2.0)
+
+        assert result.final_text == "continued"
+        assert client.initialize_kwargs["capabilities"] == {"experimentalApi": True}
+        assert requests == [
+            {
+                "provider": "codex",
+                "questions": [
+                    {
+                        "id": "framework",
+                        "header": "Framework",
+                        "question": "Which framework?",
+                        "options": [
+                            {"label": "React", "description": "Use React"},
+                            {"label": "Vue", "description": "Use Vue"},
+                        ],
+                        "is_secret": False,
+                    }
+                ],
+            }
+        ]
+        assert "unknown" not in str(requests)
+        assert client.responses == [
+            (
+                "question-1",
+                {"answers": {"framework": {"answers": ["React"]}}},
+            )
+        ]
+
+    def test_dynamic_ask_user_tool_works_in_default_mode(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/tool/call",
+            request_id="dynamic-question-1",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            callId="call-question-1",
+            tool="ask_user",
+            namespace=None,
+            arguments={
+                "question": "Which marker?",
+                "options": ["ALPHA", "BETA"],
+                "multi_select": False,
+            },
+        )
+        requests = []
+        original_respond = client.respond
+
+        def answer(request):
+            requests.append(request)
+            return {"answer": ["ALPHA"]}
+
+        def respond_and_finish(request_id, result):
+            original_respond(request_id, result)
+            client.queue_notification(
+                "item/completed",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                item={"type": "agentMessage", "id": "m1", "text": "ALPHA"},
+            )
+            client.queue_notification(
+                "turn/completed",
+                threadId="thread-fake-001",
+                turn={"id": "turn-fake-001", "status": "completed", "error": None},
+            )
+
+        client.respond = respond_and_finish
+        session = make_session(client, input_callback=answer)
+        result = session.run_turn("ask first", turn_timeout=2.0)
+
+        assert result.final_text == "ALPHA"
+        thread_start = next(
+            params for method, params in client.requests if method == "thread/start"
+        )
+        assert thread_start["dynamicTools"][0]["name"] == "ask_user"
+        assert requests == [
+            {
+                "provider": "codex",
+                "questions": [
+                    {
+                        "id": "answer",
+                        "header": "Question",
+                        "question": "Which marker?",
+                        "options": [
+                            {"label": "ALPHA", "description": ""},
+                            {"label": "BETA", "description": ""},
+                        ],
+                        "is_secret": False,
+                        "multi_select": False,
+                    }
+                ],
+            }
+        ]
+        assert client.responses == [
+            (
+                "dynamic-question-1",
+                {
+                    "success": True,
+                    "contentItems": [{"type": "inputText", "text": "ALPHA"}],
+                },
+            )
         ]
 
 

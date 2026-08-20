@@ -1977,6 +1977,15 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    if agent.api_mode == "claude_agent_sdk":
+        return agent._run_claude_agent_sdk_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:

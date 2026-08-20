@@ -16190,6 +16190,19 @@ def test_notification_event_dedup_key_preserves_distinct_watch_matches():
     assert server._notification_event_dedup_key(distinct_pattern) != base_key
 
 
+def test_notification_event_dedup_key_preserves_distinct_subagent_input_requests():
+    first = {
+        "type": "async_delegation_input",
+        "subagent_id": "sa-0-abc",
+        "request_id": "input-one",
+    }
+    second = {**first, "request_id": "input-two"}
+
+    assert server._notification_event_dedup_key(first) != (
+        server._notification_event_dedup_key(second)
+    )
+
+
 def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     """Distinct watch matches from one process emit; exact replay is deduped."""
     import queue as _queue_mod

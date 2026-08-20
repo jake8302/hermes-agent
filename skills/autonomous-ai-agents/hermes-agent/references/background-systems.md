@@ -8,10 +8,28 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 Spawn a subagent with an isolated context + terminal session.
 
-- **Single:** `delegate_task(goal, context)`.
-- **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
+- **Single:** `delegate_task(runtime="hermes", goal=goal, context=context)`.
+- **Native Claude Code:** `delegate_task(runtime="claude-code", native={"model":
+  requested_model, "effort": requested_effort, "approval_mode": "auto"}, goal=goal)`
+  uses the Claude Agent SDK. `auto` is classifier-backed permission handling,
+  independent of model selection.
+- **Native Codex:** `delegate_task(runtime="codex", native={"model":
+  requested_model, "effort": requested_effort, "approval_mode":
+  "approve_for_me"}, goal=goal)` uses Codex App Server. Approve-for-me means
+  `approvalPolicy="on-request"` plus `approvalsReviewer="auto_review"`; it
+  never disables the sandbox.
+- **Classifier approval gate:** provider classifiers may resolve permission
+  requests before Hermes' callback. `auto` / `approve_for_me` therefore require
+  the operator opt-in `delegation.native_classifier_approvals: true` (or
+  `hermes config set delegation.native_classifier_approvals true`). The default
+  is false; never work around a disabled gate.
+- **Exact-seat rule:** use `native` whenever the user specifies provider model,
+  effort, or approval mode. Do not put those settings only in goal prose and do
+  not fall back to standalone `claude -p`, `codex exec`, or `codex review`.
+  Verify with safe `native_*_requested` / `native_*_resolved` result metadata.
+- **Batch:** `delegate_task(runtime="hermes", tasks=[{goal, ...}, ...])` runs children in
   parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Background:** `delegate_task(background=true)` returns a handle
+- **Background:** `delegate_task(runtime="hermes", background=true)` returns a handle
   immediately and keeps the parent loop going; the child's result
   re-enters the conversation as a new turn when it finishes.
 - **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`

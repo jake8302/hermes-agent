@@ -143,7 +143,12 @@ done
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  HERMES_RUN_NATIVE_DELEGATION_E2E \
+  HERMES_NATIVE_DELEGATION_CLAUDE_MODEL \
+  HERMES_NATIVE_DELEGATION_CLAUDE_EFFORT \
+  HERMES_NATIVE_DELEGATION_CODEX_MODEL \
+  HERMES_NATIVE_DELEGATION_CODEX_EFFORT; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
@@ -169,6 +174,9 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${USER:+USER="$USER"} \
+  ${LOGNAME:+LOGNAME="$LOGNAME"} \
+  ${SHELL:+SHELL="$SHELL"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
   TZ=UTC \

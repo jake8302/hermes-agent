@@ -9820,6 +9820,12 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
+    if evt_type == "async_delegation_input":
+        return (
+            evt.get("subagent_id", ""),
+            evt_type,
+            evt.get("request_id", ""),
+        )
     return (evt_sid, evt_type)
 
 

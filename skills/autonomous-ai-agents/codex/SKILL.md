@@ -1,7 +1,7 @@
 ---
 name: codex
-description: "Delegate coding to OpenAI Codex CLI (features, PRs)."
-version: 1.0.1
+description: "Route managed Codex subagents; run standalone CLI sessions."
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -13,10 +13,63 @@ metadata:
 
 # Codex CLI
 
-Delegate coding tasks to [Codex](https://github.com/openai/codex) via the Hermes terminal. Codex is OpenAI's autonomous coding agent CLI.
+Use [Codex](https://github.com/openai/codex) either as a Hermes-managed native
+subagent or as a standalone CLI. Codex is OpenAI's autonomous coding agent.
 
-## When to use
+## Routing precedence
 
+When the user asks to **delegate to**, **spawn**, or **use a native Codex
+subagent**, call:
+
+```
+delegate_task(runtime="codex", goal="<self-contained task>", context="<needed context>")
+```
+
+When the user specifies a native Codex model, effort, or approve-for-me mode,
+pass it structurally rather than mentioning it only in the goal:
+
+```
+delegate_task(
+    runtime="codex",
+    native={"model": requested_model, "effort": requested_effort, "approval_mode": "approve_for_me"},
+    goal="<self-contained task>",
+    context="<needed context>",
+)
+```
+
+`approval_mode="approve_for_me"` maps to Codex App Server's classifier-backed
+reviewer (`approvalPolicy="on-request"` plus
+`approvalsReviewer="auto_review"`). It never means `approvalPolicy="never"`
+and does not disable the sandbox. Model, effort, and approval mode are
+independent. Because the provider classifier may resolve requests before
+Hermes' callback, the operator must first opt in with
+`hermes config set delegation.native_classifier_approvals true`. If that gate
+is off, omit `approval_mode` or surface the pre-dispatch error; never bypass it.
+Omitted fields keep provider defaults. Trust the completion's
+`native_*_resolved` metadata—not the child's prose—when verifying the seat.
+Codex App Server does not echo a per-turn effort override, so effort remains
+`native_effort_requested` rather than a resolved claim.
+Never fall back to `codex exec` or `codex review` when managed configuration
+fails; surface the error instead.
+
+This keeps Hermes responsible for worker identity, background completion,
+steering, stopping, resume, and cleanup while Codex App Server owns the native
+thread. Do **not** replace this managed path with `codex exec`, `codex review`,
+or another `terminal` call.
+
+If the managed child reports `waiting_for_input`, ask the human with `clarify`,
+then call `delegate_task(runtime="codex", action="respond", ...)` with the exact
+subagent ID, request ID, and question IDs from the request. Never invent the
+answer. Stop the child if the human declines. Secret-input requests fail closed
+and must not be relayed through model-visible text.
+
+Use the standalone CLI instructions below only when the user explicitly asks to
+run the Codex CLI, wants a visible interactive terminal, or needs a CLI-only
+command.
+
+## When to use the standalone CLI
+
+- Explicit standalone or visible Codex CLI sessions
 - Building features
 - Refactoring
 - PR reviews
@@ -140,12 +193,19 @@ terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ```
 
-## Rules
+## Rules for standalone Codex CLI sessions
 
-1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
+1. **For standalone Codex CLI runs, always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
 2. **Git repo required** — Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch
-3. **Use `exec` for one-shots** — `codex exec "prompt"` runs and exits cleanly
+3. **For standalone one-shots, use `exec`** — `codex exec "prompt"` runs and exits cleanly
 4. **`--sandbox workspace-write` for building** — auto-approves changes within the sandbox (`--full-auto` is deprecated for this)
 5. **Background for long tasks** — use `background=true` and monitor with `process` tool
 6. **Don't interfere** — monitor with `poll`/`log`, be patient with long-running tasks
 7. **Parallel is fine** — run multiple Codex processes at once for batch work
+
+## Routing reminder
+
+For a managed Codex subagent, always call
+`delegate_task(runtime="codex", goal="...")`. The standalone rules above apply
+only when the user explicitly asks for the Codex CLI or a visible interactive
+terminal session.

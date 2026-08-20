@@ -95,6 +95,8 @@ logger = logging.getLogger(__name__)
 
 
 LAZY_DEPS: dict[str, tuple[str, ...]] = {
+    # Provider-native delegated Claude Code sessions.
+    "delegation.claude-code": ("claude-agent-sdk==0.2.142",),
     # ─── Inference providers ───────────────────────────────────────────────
     # Native Anthropic SDK — needed when provider=anthropic (not via
     # OpenRouter / aggregators which use the openai SDK).

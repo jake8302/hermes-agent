@@ -115,6 +115,17 @@ def _get_subagent_approval_callback():
         return _subagent_auto_approve
     return _subagent_auto_deny
 
+
+def _native_classifier_approvals_enabled() -> bool:
+    """Return the operator-owned opt-in for provider classifier approvals.
+
+    This must remain config-backed rather than model-controlled: the model may
+    select a provider's classifier mode only after the operator enables the
+    capability in ``delegation.native_classifier_approvals``.
+    """
+    cfg = _load_config()
+    return is_truthy_value(cfg.get("native_classifier_approvals", False))
+
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
@@ -217,6 +228,165 @@ def _register_subagent(record: Dict[str, Any]) -> None:
         _active_subagents[sid] = record
 
 
+def _cancel_record_input_waiter(record: Dict[str, Any]) -> None:
+    waiter = record.get("_input_waiter")
+    if not isinstance(waiter, dict):
+        return
+    waiter["cancelled"] = True
+    event = waiter.get("event")
+    if isinstance(event, threading.Event):
+        event.set()
+
+
+def _sanitize_subagent_input_request(request: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(request, dict):
+        return None
+    questions = []
+    for raw_question in (request.get("questions") or [])[:8]:
+        if not isinstance(raw_question, dict):
+            continue
+        question_id = str(raw_question.get("id") or "")[:128]
+        question_text = str(raw_question.get("question") or "")[:2000]
+        if not question_id or not question_text:
+            continue
+        options = []
+        for raw_option in (raw_question.get("options") or [])[:8]:
+            if not isinstance(raw_option, dict):
+                continue
+            options.append(
+                {
+                    "label": str(raw_option.get("label") or "")[:200],
+                    "description": str(raw_option.get("description") or "")[:500],
+                }
+            )
+        questions.append(
+            {
+                "id": question_id,
+                "header": str(raw_question.get("header") or "")[:200],
+                "question": question_text,
+                "options": options,
+                "multi_select": bool(raw_question.get("multi_select", False)),
+                "is_secret": bool(raw_question.get("is_secret", False)),
+            }
+        )
+    if not questions or any(question["is_secret"] for question in questions):
+        return None
+    return {
+        "request_id": f"input-{os.urandom(6).hex()}",
+        "provider": str(request.get("provider") or "native")[:64],
+        "questions": questions,
+    }
+
+
+def _request_subagent_input(
+    subagent_id: str,
+    request: Any,
+) -> Optional[Dict[str, List[str]]]:
+    safe_request = _sanitize_subagent_input_request(request)
+    if safe_request is None:
+        logger.warning(
+            "Subagent %s input request was empty, malformed, or secret; denying",
+            subagent_id,
+        )
+        return None
+    waiter: Dict[str, Any] = {
+        "event": threading.Event(),
+        "answers": None,
+        "cancelled": False,
+        "request_id": safe_request["request_id"],
+    }
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None or record.get("_input_waiter") is not None:
+            return None
+        record["_input_waiter"] = waiter
+        record["input_request"] = safe_request
+        record["status"] = "waiting_for_input"
+        event = {
+            "type": "async_delegation_input",
+            "delegation_id": record.get("delegation_id"),
+            "subagent_id": subagent_id,
+            "request_id": safe_request["request_id"],
+            "session_key": record.get("owner_agent_session_id", ""),
+            "origin_ui_session_id": record.get("owner_session_id", ""),
+            "parent_session_id": record.get("owner_agent_session_id"),
+            "goal": record.get("goal", ""),
+            "input_request": safe_request,
+        }
+
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(event)
+    except Exception:
+        logger.exception("Could not enqueue subagent input request %s", subagent_id)
+        with _active_subagents_lock:
+            record = _active_subagents.get(subagent_id)
+            if record is not None and record.get("_input_waiter") is waiter:
+                _cancel_record_input_waiter(record)
+                record.pop("_input_waiter", None)
+                record.pop("input_request", None)
+                record["status"] = "running"
+        return None
+
+    waiter["event"].wait()
+
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is not None and record.get("_input_waiter") is waiter:
+            record.pop("_input_waiter", None)
+            record.pop("input_request", None)
+            record["status"] = "running"
+    if waiter.get("cancelled"):
+        return None
+    answers = waiter.get("answers")
+    return answers if isinstance(answers, dict) else None
+
+
+def _respond_subagent_input(
+    subagent_id: str,
+    request_id: str,
+    answers: Any,
+) -> bool:
+    if not isinstance(answers, dict):
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None:
+            return False
+        waiter = record.get("_input_waiter")
+        request = record.get("input_request")
+        if (
+            not isinstance(waiter, dict)
+            or not isinstance(request, dict)
+            or request.get("request_id") != request_id
+            or waiter.get("answered") is True
+        ):
+            return False
+        allowed_ids = {
+            str(question.get("id"))
+            for question in request.get("questions", [])
+            if isinstance(question, dict) and question.get("id")
+        }
+        safe_answers: Dict[str, List[str]] = {}
+        for raw_id, raw_values in answers.items():
+            question_id = str(raw_id)
+            if question_id not in allowed_ids or not isinstance(raw_values, list):
+                continue
+            safe_answers[question_id] = [
+                str(raw_value)[:2000] for raw_value in raw_values[:8]
+            ]
+        if not safe_answers:
+            return False
+        waiter["answered"] = True
+        waiter["answers"] = safe_answers
+        record["status"] = "running"
+        event = waiter.get("event")
+        if isinstance(event, threading.Event):
+            event.set()
+        return True
+
+
 def _retain_recent_subagent(record: Dict[str, Any]) -> None:
     """Keep a bounded attribution stub after a child finishes (lock held)."""
     sid = record.get("subagent_id")
@@ -235,6 +405,7 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
         if record is not None and (agent is None or record.get("agent") is agent):
+            _cancel_record_input_waiter(record)
             _active_subagents.pop(subagent_id, None)
             _retain_recent_subagent(record)
 
@@ -273,6 +444,8 @@ def interrupt_subagent(subagent_id: str) -> bool:
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
+        if record is not None:
+            _cancel_record_input_waiter(record)
     if not record:
         return False
     agent = record.get("agent")
@@ -371,6 +544,7 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_transport",
                     "owner_session_record",
                     "accepting_steer",
+                    "_input_waiter",
                 }
             }
             for r in _active_subagents.values()
@@ -400,7 +574,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "respond"})
 
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
@@ -468,6 +642,9 @@ def _handle_control_action(
     subagent_id: Optional[str],
     message: Optional[str],
     parent_agent: Any,
+    *,
+    request_id: Optional[str] = None,
+    answers: Any = None,
 ) -> str:
     """Synchronous control plane for delegate_task: list/steer/stop.
 
@@ -484,22 +661,25 @@ def _handle_control_action(
             if not _owns_subagent_record(r, parent_agent):
                 continue
             started = r.get("started_at")
-            entries.append(
-                {
-                    "subagent_id": r.get("subagent_id"),
-                    "parent_id": r.get("parent_id"),
-                    "goal": r.get("goal"),
-                    "model": r.get("model"),
-                    "status": r.get("status"),
-                    "running_seconds": (
-                        round(time.time() - started, 1)
-                        if isinstance(started, (int, float))
-                        else None
-                    ),
-                    "accepting_steer": bool(r.get("accepting_steer", False)),
-                    "live_transcript": getattr(agent, "_live_transcript_path", None),
-                }
-            )
+            entry = {
+                "subagent_id": r.get("subagent_id"),
+                "parent_id": r.get("parent_id"),
+                "goal": r.get("goal"),
+                "model": r.get("model"),
+                "status": r.get("status"),
+                "running_seconds": (
+                    round(time.time() - started, 1)
+                    if isinstance(started, (int, float))
+                    else None
+                ),
+                "accepting_steer": bool(r.get("accepting_steer", False)),
+                "live_transcript": getattr(agent, "_live_transcript_path", None),
+            }
+            entry.update(_managed_native_metadata(agent))
+            input_request = r.get("input_request")
+            if isinstance(input_request, dict):
+                entry["input_request"] = input_request
+            entries.append(entry)
         payload: Dict[str, Any] = {
             "action": "list",
             "count": len(entries),
@@ -527,6 +707,27 @@ def _handle_control_action(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "
             "may have already finished (its result arrives as a normal "
             "completion message). Use action='list' to see live children."
+        )
+
+    if action == "respond":
+        input_request_id = str(request_id or "").strip()
+        if not input_request_id or not isinstance(answers, dict):
+            return tool_error(
+                "action='respond' requires request_id and an answers object."
+            )
+        if _respond_subagent_input(sid, input_request_id, answers):
+            return json.dumps(
+                {
+                    "action": "respond",
+                    "subagent_id": sid,
+                    "request_id": input_request_id,
+                    "status": "answered",
+                },
+                ensure_ascii=False,
+            )
+        return tool_error(
+            f"No matching pending input request '{input_request_id}' for "
+            f"subagent '{sid}'. Use action='list' to refresh its status."
         )
 
     if action == "stop":
@@ -573,13 +774,40 @@ def _handle_control_action(
                 },
                 ensure_ascii=False,
             )
+        _target_agent = record.get("agent")
+        _api_mode = str(getattr(_target_agent, "api_mode", "") or "")
+        _native_session_attr = {
+            "codex_app_server": "_codex_session",
+            "claude_agent_sdk": "_claude_sdk_session",
+        }.get(_api_mode)
+        if _native_session_attr and getattr(
+            _target_agent,
+            _native_session_attr,
+            None,
+        ) is None:
+            return json.dumps(
+                {
+                    "action": "steer",
+                    "subagent_id": sid,
+                    "status": "starting",
+                    "retryable": True,
+                    "note": (
+                        "The native provider session is still starting, so the "
+                        "steer was not queued. Retry after the child reports "
+                        "provider or tool activity."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         return tool_error(
             f"Subagent '{sid}' is no longer accepting steering (finishing or "
             "already finished). Its result arrives as a normal completion "
             "message; re-delegate a follow-up task if more work is needed."
         )
 
-    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+    return tool_error(
+        f"Unknown action '{action}'. Use spawn, list, steer, stop, or respond."
+    )
 
 
 def _extract_output_tail(
@@ -841,6 +1069,208 @@ def _normalize_role(r: Optional[str]) -> str:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
+
+
+# ── Managed native seat configuration ───────────────────────────────────────
+# The model-facing `native` object pins the provider-native seat a delegated
+# claude-code / codex worker runs on. Every value below is validated against
+# the PINNED provider contract, not against prose:
+#
+#   claude-code -> claude_agent_sdk.ClaudeAgentOptions(model=, effort=,
+#                  permission_mode=). `effort` accepts exactly the SDK's
+#                  EffortLevel literal; `approval_mode="auto"` selects the
+#                  CLI's classifier-backed permission auto mode.
+#   codex       -> App Server v2 ThreadStartParams / TurnStartParams
+#                  (model, effort, approvalPolicy, approvalsReviewer).
+#                  `approval_mode="approve_for_me"` is exactly
+#                  approvalPolicy="on-request" + approvalsReviewer="auto_review".
+#
+# approval_mode is deliberately INDEPENDENT of model/effort: a caller can pin
+# a seat without changing who reviews approvals, and vice versa.
+NATIVE_CONFIG_FIELDS = ("model", "effort", "approval_mode")
+
+# claude-code: claude_agent_sdk.types.EffortLevel, verbatim.
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# codex: the App Server declares ReasoningEffort as any non-empty
+# model-advertised string, so this is the documented set Hermes accepts —
+# an unlisted value is refused here rather than failing mid-turn.
+_CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_NATIVE_EFFORTS_BY_RUNTIME = {
+    "claude-code": _CLAUDE_EFFORTS,
+    "codex": _CODEX_EFFORTS,
+}
+# Classifier-backed approval modes, keyed by the runtime that implements one.
+# "default" means "leave the provider's own default alone" everywhere.
+_NATIVE_APPROVAL_MODES_BY_RUNTIME = {
+    "claude-code": ("default", "auto"),
+    "codex": ("default", "approve_for_me"),
+}
+_NATIVE_APPROVAL_MODES = ("default", "auto", "approve_for_me")
+
+_MAX_NATIVE_MODEL_LEN = 128
+_MAX_NATIVE_METADATA_VALUE_LEN = 256
+
+
+def _coerce_native_config(
+    raw: Any,
+    runtime: str,
+    label: str,
+) -> tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Validate one ``native`` request against *runtime*'s provider contract.
+
+    Returns ``(config, None)`` on success — ``config`` is None when nothing
+    was requested, so omitted fields keep every provider default. Returns
+    ``(None, error)`` with a precise, model-actionable message otherwise.
+    *label* prefixes the error ("delegate_task" or "Task 2").
+    """
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        # Small models sometimes emit the object as a JSON string.
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None, (
+                f"{label}: 'native' must be an object with any of "
+                f"{', '.join(NATIVE_CONFIG_FIELDS)}."
+            )
+    if not isinstance(raw, dict):
+        return None, (
+            f"{label}: 'native' must be an object, got {type(raw).__name__}."
+        )
+    unknown = [key for key in raw if key not in NATIVE_CONFIG_FIELDS]
+    if unknown:
+        return None, (
+            f"{label}: unknown native option(s) {', '.join(sorted(unknown))}. "
+            f"Use only {', '.join(NATIVE_CONFIG_FIELDS)}."
+        )
+    requested: Dict[str, str] = {}
+    for key in NATIVE_CONFIG_FIELDS:
+        raw_value = raw.get(key)
+        if raw_value is None:
+            continue
+        if not isinstance(raw_value, str):
+            return None, f"{label}: native.{key} must be a string."
+        value = raw_value.strip()
+        if value:
+            requested[key] = value
+    if not requested:
+        return None, None
+    if runtime not in _NATIVE_EFFORTS_BY_RUNTIME:
+        return None, (
+            f"{label}: 'native' requires runtime claude-code or codex; "
+            f"runtime '{runtime}' has no managed native seat. Drop 'native' "
+            "or switch runtime."
+        )
+
+    config: Dict[str, str] = {}
+    model = requested.get("model")
+    if model is not None:
+        if (
+            len(model) > _MAX_NATIVE_MODEL_LEN
+            or not model.isascii()
+            or any(
+                character.isspace() or not character.isprintable()
+                for character in model
+            )
+        ):
+            return None, (
+                f"{label}: native.model must be a single provider model id "
+                f"of at most {_MAX_NATIVE_MODEL_LEN} characters "
+                "as reported by the provider's native model catalog."
+            )
+        config["model"] = model
+
+    effort = requested.get("effort")
+    if effort is not None:
+        allowed_efforts = _NATIVE_EFFORTS_BY_RUNTIME[runtime]
+        if effort.lower() not in allowed_efforts:
+            return None, (
+                f"{label}: native.effort '{effort}' is not valid for runtime "
+                f"{runtime}. Use one of {', '.join(allowed_efforts)}."
+            )
+        config["effort"] = effort.lower()
+
+    approval_mode = requested.get("approval_mode")
+    if approval_mode is not None:
+        allowed_modes = _NATIVE_APPROVAL_MODES_BY_RUNTIME[runtime]
+        normalized_mode = approval_mode.lower()
+        if normalized_mode not in allowed_modes:
+            managed_mode = next(
+                mode for mode in allowed_modes if mode != "default"
+            )
+            return None, (
+                f"{label}: native.approval_mode '{approval_mode}' is not "
+                f"valid for runtime {runtime}. Use 'default' or "
+                f"'{managed_mode}'."
+            )
+        if normalized_mode != "default":
+            config["approval_mode"] = normalized_mode
+
+    return (config or None), None
+
+
+def _safe_native_metadata_value(value: Any) -> Optional[str]:
+    """Bound provider metadata and reject invisible/control characters."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if (
+        not value
+        or len(value) > _MAX_NATIVE_METADATA_VALUE_LEN
+        or any(character.isspace() or not character.isprintable() for character in value)
+    ):
+        return None
+    return value
+
+
+def _managed_native_metadata(
+    child: Any,
+    result: Any = None,
+) -> Dict[str, str]:
+    """Return the safe, provider-owned native configuration projection."""
+    runtime = str(getattr(child, "_delegate_runtime", "") or "").strip().lower()
+    if runtime not in {"claude-code", "codex"}:
+        return {}
+
+    metadata: Dict[str, str] = {"runtime": runtime}
+    native_config = getattr(child, "_delegate_native_config", None)
+    if isinstance(native_config, dict):
+        for field in NATIVE_CONFIG_FIELDS:
+            value = _safe_native_metadata_value(native_config.get(field))
+            if value is not None:
+                metadata[f"native_{field}_requested"] = value
+
+    native_session = (
+        getattr(child, "_codex_session", None)
+        if runtime == "codex"
+        else getattr(child, "_claude_sdk_session", None)
+    )
+    session_fields = {
+        "native_model_resolved": "resolved_model",
+        "native_effort_resolved": "resolved_effort",
+        "native_approval_policy_resolved": "resolved_approval_policy",
+        "native_approvals_reviewer_resolved": "resolved_approvals_reviewer",
+    }
+    for output_key, attribute in session_fields.items():
+        value = _safe_native_metadata_value(getattr(native_session, attribute, None))
+        if value is not None:
+            metadata[output_key] = value
+
+    if isinstance(result, dict):
+        for key in (
+            "native_model_requested",
+            "native_effort_requested",
+            "native_approval_mode_requested",
+            "native_model_resolved",
+            "native_effort_resolved",
+            "native_approval_policy_resolved",
+            "native_approvals_reviewer_resolved",
+        ):
+            value = _safe_native_metadata_value(result.get(key))
+            if value is not None:
+                metadata[key] = value
+    return metadata
 
 
 def _get_max_concurrent_children() -> int:
@@ -1584,6 +2014,9 @@ def _build_child_agent(
     max_iterations: int,
     task_count: int,
     parent_agent,
+    runtime: str = "hermes",
+    resume_session_id: Optional[str] = None,
+    native_config: Optional[Dict[str, str]] = None,
     # Credential overrides from delegation config (provider:model resolution)
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
@@ -1819,6 +2252,29 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
+    if runtime == "codex":
+        # Native delegated runtimes own their provider transport and auth.
+        # Do not forward the parent's API credentials or endpoint into the
+        # Codex subprocess. The marker client is never used by the App Server
+        # turn path, but keeps AIAgent's common initialization contract intact.
+        effective_model = "codex"
+        effective_provider = "openai-codex"
+        effective_base_url = "http://localhost/codex-app-server"
+        effective_api_key = "codex-app-server"
+        effective_api_mode = "codex_app_server"
+        effective_acp_command = None
+        effective_acp_args = []
+    elif runtime == "claude-code":
+        # The SDK owns Claude Code auth and provider context. The marker client
+        # satisfies AIAgent's shared initializer but is never called.
+        effective_model = "claude-code"
+        effective_provider = "claude-code"
+        effective_base_url = "http://localhost/claude-agent-sdk"
+        effective_api_key = "claude-agent-sdk"
+        effective_api_mode = "claude_agent_sdk"
+        effective_acp_command = None
+        effective_acp_args = []
+
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
@@ -1986,6 +2442,27 @@ def _build_child_agent(
                     pass
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    setattr(child, "_delegate_runtime", runtime)
+    # The validated managed native seat. None means "every provider default
+    # stands" — the native runtimes read this attribute and send nothing when
+    # it is absent, so omitting `native` is byte-identical to the old path.
+    setattr(
+        child,
+        "_delegate_native_config",
+        dict(native_config) if native_config else None,
+    )
+    if runtime != "hermes":
+        # Provider-native runtimes launch their own subprocesses and cannot
+        # consult terminal_tool's per-task cwd record. Stamp the resolved
+        # workspace directly onto the child before its first native turn.
+        setattr(child, "session_cwd", workspace_hint)
+        setattr(
+            child,
+            "_delegate_approval_callback",
+            _get_subagent_approval_callback(),
+        )
+        if resume_session_id:
+            setattr(child, "_native_resume_session_id", resume_session_id)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
     # close it out from under a background child (#81267).
@@ -2002,6 +2479,15 @@ def _build_child_agent(
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
+    if runtime in {"claude-code", "codex"}:
+        setattr(
+            child,
+            "_delegate_input_callback",
+            lambda request, _subagent_id=subagent_id: _request_subagent_input(
+                _subagent_id,
+                request,
+            ),
+        )
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
@@ -2696,7 +3182,13 @@ def _run_single_child(
                 register_container_alias,
             )
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            parent_live_cwd = get_session_cwd(parent_task_id)
+            record_session_cwd(child_task_id, parent_live_cwd)
+            if (
+                parent_live_cwd
+                and getattr(child, "_delegate_runtime", "hermes") != "hermes"
+            ):
+                setattr(child, "session_cwd", parent_live_cwd)
             # Per-session container isolation (docker + container_persistent:
             # false) keys containers by session task_id. The child must share
             # the PARENT's container — register the alias so the child's
@@ -2737,6 +3229,8 @@ def _run_single_child(
                     from tools.terminal_tool import record_session_cwd as _rsc
 
                     _rsc(child_task_id, _worktree_info["path"])
+                    if getattr(child, "_delegate_runtime", "hermes") != "hermes":
+                        setattr(child, "session_cwd", _worktree_info["path"])
                 except Exception as e:
                     logger.debug("worktree cwd seed failed: %s", e)
                 # The child's context is already built; carry the isolation
@@ -2909,6 +3403,29 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            _native_runtime = str(
+                getattr(child, "_delegate_runtime", "") or ""
+            ).strip().lower()
+            if _native_runtime in {"claude-code", "codex"}:
+                _error_entry["runtime"] = _native_runtime
+                _native_session = (
+                    getattr(child, "_codex_session", None)
+                    if _native_runtime == "codex"
+                    else getattr(child, "_claude_sdk_session", None)
+                )
+                _native_session_id = (
+                    getattr(_native_session, "thread_id", None)
+                    if _native_runtime == "codex"
+                    else getattr(_native_session, "session_id", None)
+                )
+                _native_session_id = _native_session_id or getattr(
+                    child,
+                    "_native_resume_session_id",
+                    None,
+                )
+                if isinstance(_native_session_id, str) and _native_session_id:
+                    _error_entry["native_session_id"] = _native_session_id
+                _error_entry.update(_managed_native_metadata(child))
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
                 _error_entry["error"] += (
@@ -3082,6 +3599,7 @@ def _run_single_child(
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
+            "runtime": str(getattr(child, "_delegate_runtime", "hermes") or "hermes"),
             "status": status,
             "summary": summary,
             "api_calls": api_calls,
@@ -3133,6 +3651,26 @@ def _run_single_child(
             _cost_status if isinstance(_cost_status, str) and _cost_status
             else "unknown"
         )
+        _native_session_id = (
+            result.get("native_session_id") or result.get("codex_thread_id")
+        )
+        if isinstance(_native_session_id, str) and _native_session_id:
+            entry["native_session_id"] = _native_session_id
+        entry.update(_managed_native_metadata(child, result))
+        _raw_denials = result.get("approval_denials")
+        if isinstance(_raw_denials, list):
+            _safe_denials = []
+            for _raw_denial in _raw_denials:
+                if not isinstance(_raw_denial, dict):
+                    continue
+                _safe_denial = {
+                    key: str(_raw_denial.get(key) or "")[:160]
+                    for key in ("provider", "kind", "reason")
+                }
+                if any(_safe_denial.values()):
+                    _safe_denials.append(_safe_denial)
+            if _safe_denials:
+                entry["approval_denials"] = _safe_denials
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -3600,11 +4138,16 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    runtime: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    native: Optional[Dict[str, Any]] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    request_id: Optional[str] = None,
+    answers: Optional[Dict[str, List[str]]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3631,17 +4174,22 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
-    # ── Control plane: list/steer/stop run synchronously and return here.
+    # ── Control plane: list/steer/stop/respond return synchronously here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
     # async dispatch machinery entirely.
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(
-            normalized_action, subagent_id, message, parent_agent
+            normalized_action,
+            subagent_id,
+            message,
+            parent_agent,
+            request_id=request_id,
+            answers=answers,
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+            f"Unknown action '{action}'. Use spawn, list, steer, stop, or respond."
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -3655,6 +4203,17 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    top_runtime = str(runtime or "hermes").strip().lower()
+    if top_runtime not in {"hermes", "claude-code", "codex"}:
+        return tool_error(
+            f"Unknown delegation runtime '{runtime}'. Use hermes, claude-code, or codex."
+        )
+    top_resume_session_id = str(resume_session_id or "").strip() or None
+    if top_resume_session_id and top_runtime == "hermes" and not tasks:
+        return tool_error("resume_session_id requires runtime claude-code or codex.")
+    # `native` is validated per task (below) against the runtime that task
+    # will actually run on, so a per-task runtime override is checked against
+    # its own provider contract rather than the top-level default.
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3719,6 +4278,9 @@ def delegate_task(
     if isinstance(tasks, list) and not tasks:
         tasks = None
 
+    if top_resume_session_id and tasks is not None:
+        return tool_error("Batch resume_session_id values must be set per task.")
+
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
             return tool_error(
@@ -3730,7 +4292,14 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "runtime": top_runtime,
+            "resume_session_id": top_resume_session_id,
+            "native": native,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3748,6 +4317,44 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        task_runtime = str(task.get("runtime") or top_runtime).strip().lower()
+        if task_runtime not in {"hermes", "claude-code", "codex"}:
+            return tool_error(
+                f"Task {i} has unknown runtime '{task.get('runtime')}'. "
+                "Use hermes, claude-code, or codex."
+            )
+        task["runtime"] = task_runtime
+        task_resume_session_id = str(
+            task.get("resume_session_id") or top_resume_session_id or ""
+        ).strip() or None
+        if task_resume_session_id and task_runtime == "hermes":
+            return tool_error(
+                f"Task {i}: resume_session_id requires runtime claude-code or codex."
+            )
+        task["resume_session_id"] = task_resume_session_id
+        # Per-task `native` replaces (never merges with) the top-level one, so
+        # a task that pins its own seat is fully self-describing.
+        raw_native = task.get("native")
+        if raw_native is None:
+            raw_native = native
+        task_native_config, native_error = _coerce_native_config(
+            raw_native,
+            task_runtime,
+            "delegate_task" if tasks is None else f"Task {i}",
+        )
+        if native_error:
+            return tool_error(native_error)
+        if (
+            task_native_config
+            and task_native_config.get("approval_mode")
+            and not _native_classifier_approvals_enabled()
+        ):
+            error_label = "delegate_task" if tasks is None else f"Task {i}"
+            return tool_error(
+                f"{error_label}: native.approval_mode requires the operator to set "
+                "delegation.native_classifier_approvals: true"
+            )
+        task["native"] = task_native_config
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3849,6 +4456,9 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
+                runtime=t["runtime"],
+                resume_session_id=t.get("resume_session_id"),
+                native_config=t.get("native"),
                 override_provider=creds["provider"],
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
@@ -3886,6 +4496,11 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    if not background:
+        for _i, _task, child in children:
+            if getattr(child, "_delegate_runtime", "") in {"claude-code", "codex"}:
+                setattr(child, "_delegate_input_callback", None)
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -4612,38 +5227,37 @@ def _build_top_level_description() -> str:
     here, check it is not already stated in a parameter description.
     """
     return (
-        "Spawn subagents in isolated contexts; each gets its own conversation, "
-        "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
-        "USE FOR: reasoning-heavy subtasks, work that would flood your context "
-        "with intermediate data, or independent parallel workstreams.\n"
+        "Spawn subagents in isolated contexts with separate conversations, "
+        "terminal sessions, and toolsets; only final summaries return. Use "
+        "'goal' for one task or 'tasks' for a parallel batch (limits and nesting "
+        "rules are in the parameter descriptions).\n\n"
+        "RUNTIME ROUTING: for a managed native Claude Code subagent, use "
+        "runtime='claude-code'; for a managed native Codex subagent, use "
+        "runtime='codex'. Hermes owns lifecycle and completion. "
+        "Pass 'hermes' for default. Ignored for control actions. Do NOT launch standalone "
+        "claude or codex commands through terminal for managed subagents; use "
+        "terminal only for explicitly requested CLI or visible sessions.\n\n"
+        "Runs in the background: dispatch returns immediately with live transcript "
+        "paths; completion re-enters the conversation automatically. Do NOT wait "
+        "or poll; continue other work.\n\n"
+        "LIVE ORCHESTRATION: action='list' shows children; action='steer' redirects "
+        "one using subagent_id + message; action='stop' ends one early and returns "
+        "its partial result. Steer when a live transcript shows drift.\n\n"
+        "USE FOR: reasoning-heavy subtasks, context-heavy work, or independent "
+        "parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
         "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
         "- A single tool call -> call the tool directly\n"
-        "- Tasks needing user interaction -> subagents cannot ask questions\n"
+        "- Native workers may ask non-secret questions; other children cannot\n"
         "- Durable work that must survive this session -> cronjob or "
         "terminal(background=True, notify_on_complete=True); /stop, /new, or "
         "process exit discards running subagents.\n\n"
         "RULES:\n"
-        "- Children know nothing of this conversation: pass everything needed "
-        "via 'context', including any required output language, tone, or "
-        "style (e.g. \"respond in Chinese\").\n"
+        "- Children know nothing of this conversation: pass all needed context, "
+        "including language or style (e.g. \"respond in Chinese\").\n"
         "- Child summaries are SELF-REPORTS, not verified facts: a child "
-        "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
-        "For external side effects (uploads, remote writes, publishing), "
-        "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
+        "claiming external side effects succeeded may be wrong. Require a handle "
+        "and verify it yourself — fetch the URL, stat the file, or read it back.\n"
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
@@ -4702,6 +5316,56 @@ def _build_role_param_description() -> str:
         "worker, cannot delegate further. 'orchestrator' = can "
         f"use delegate_task to spawn its own workers. {nesting_note}"
     )
+
+
+def _build_native_schema_property(description: str) -> dict:
+    """Model-facing shape of the managed native seat object.
+
+    One nested object (rather than flat `native_model` / `native_effort` /
+    `native_approval_mode` params) keeps the provider-native seat clearly
+    separate from Hermes' own operator-configured delegation.model /
+    delegation.provider routing, which the model never controls.
+    """
+    return {
+        "type": "object",
+        "description": description,
+        "properties": {
+            "model": {
+                "type": "string",
+                "description": (
+                    "Exact provider model id from the native provider's model "
+                    "catalog. Omit to keep the provider default."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "enum": sorted(set(_CLAUDE_EFFORTS) | set(_CODEX_EFFORTS)),
+                "description": (
+                    "Native reasoning effort. claude-code accepts "
+                    f"{', '.join(_CLAUDE_EFFORTS)}; codex accepts "
+                    f"{', '.join(_CODEX_EFFORTS)}. Independent of "
+                    "approval_mode."
+                ),
+            },
+            "approval_mode": {
+                "type": "string",
+                "enum": list(_NATIVE_APPROVAL_MODES),
+                "description": (
+                    "'default' keeps the provider's own approval behaviour. "
+                    "'auto' (claude-code only) selects Claude Code's "
+                    "classifier-backed permission auto mode. "
+                    "'approve_for_me' (codex only) selects codex's "
+                    "approve-for-me reviewer (approvalPolicy=on-request plus "
+                    "approvalsReviewer=auto_review). Both classifier modes "
+                    "require the operator-owned config opt-in "
+                    "delegation.native_classifier_approvals=true because the "
+                    "provider may resolve requests before Hermes' callback. "
+                    "Neither mode disables the provider sandbox."
+                ),
+            },
+        },
+        "additionalProperties": False,
+    }
 
 
 def _build_dynamic_schema_overrides() -> dict:
@@ -4776,6 +5440,25 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "runtime": {
+                            "type": "string",
+                            "enum": ["hermes", "claude-code", "codex"],
+                            "description": (
+                                "Per-task child runtime. Omit to inherit the "
+                                "top-level runtime."
+                            ),
+                        },
+                        "resume_session_id": {
+                            "type": "string",
+                            "description": (
+                                "Opaque native session ID returned by an earlier "
+                                "claude-code or codex task."
+                            ),
+                        },
+                        "native": _build_native_schema_property(
+                            "Per-task managed native seat. Replaces (does not "
+                            "merge with) the top-level 'native'."
+                        ),
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -4802,6 +5485,29 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "runtime": {
+                "type": "string",
+                "enum": ["hermes", "claude-code", "codex"],
+                "description": (
+                    "Child runtime. hermes uses the existing nested Hermes "
+                    "agent; claude-code uses the Claude Agent SDK; codex uses "
+                    "the native Codex App Server. Defaults to hermes."
+                ),
+            },
+            "resume_session_id": {
+                "type": "string",
+                "description": (
+                    "Opaque native session ID returned by an earlier claude-code "
+                    "or codex task. Requires the matching native runtime."
+                ),
+            },
+            "native": _build_native_schema_property(
+                "Managed native seat for runtime claude-code or codex. Set this "
+                "whenever the user names a native model, reasoning effort, or "
+                "approval mode — never launch a standalone `claude` / `codex` "
+                "terminal command to honour such a request. Omitted fields keep "
+                "the provider default. Rejected on runtime hermes."
+            ),
             "output_schema": {
                 "type": "object",
                 "description": (
@@ -4824,7 +5530,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "action": {
                 "type": "string",
-                "enum": ["spawn", "list", "steer", "stop"],
+                "enum": ["spawn", "list", "steer", "stop", "respond"],
                 "description": (
                     "Default 'spawn' (omit for normal delegation). Live "
                     "orchestration of running subagents: 'list' shows this "
@@ -4832,7 +5538,9 @@ DELEGATE_TASK_SCHEMA = {
                     "transcript paths); 'steer' queues course-correction text "
                     "into one child (requires subagent_id + message) without "
                     "stopping it; 'stop' ends one child early (requires "
-                    "subagent_id) — its partial result still returns as a "
+                    "subagent_id); 'respond' answers a waiting native child "
+                    "(requires subagent_id + request_id + answers). A stopped "
+                    "child's partial result still returns as a "
                     "completion message. Control actions return immediately; "
                     "goal/tasks are ignored when action is not 'spawn'."
                 ),
@@ -4840,7 +5548,7 @@ DELEGATE_TASK_SCHEMA = {
             "subagent_id": {
                 "type": "string",
                 "description": (
-                    "Target for action='steer'/'stop'. Ids are returned in the "
+                    "Target for action='steer'/'stop'/'respond'. Ids are returned in the "
                     "spawn dispatch response (subagent_ids) and by "
                     "action='list'."
                 ),
@@ -4854,8 +5562,26 @@ DELEGATE_TASK_SCHEMA = {
                     "and return early results\")."
                 ),
             },
+            "request_id": {
+                "type": "string",
+                "description": (
+                    "For action='respond': the exact request_id shown by the "
+                    "waiting_for_input notification or action='list'."
+                ),
+            },
+            "answers": {
+                "type": "object",
+                "description": (
+                    "For action='respond': question id to selected answer strings. "
+                    "Use only ids and choices from the pending input request."
+                ),
+                "additionalProperties": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
         },
-        "required": [],
+        "required": ["runtime"],
     },
 }
 
@@ -4913,11 +5639,16 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        runtime=args.get("runtime"),
+        resume_session_id=args.get("resume_session_id"),
+        native=args.get("native"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        request_id=args.get("request_id"),
+        answers=args.get("answers"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

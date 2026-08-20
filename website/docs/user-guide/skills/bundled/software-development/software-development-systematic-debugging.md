@@ -394,6 +394,7 @@ For complex multi-component debugging, dispatch investigation subagents:
 
 ```python
 delegate_task(
+    runtime="hermes",
     goal="Investigate why [specific test/behavior] fails",
     context="""
     Follow systematic-debugging skill:

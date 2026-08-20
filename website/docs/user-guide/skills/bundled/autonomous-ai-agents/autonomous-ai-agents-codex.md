@@ -1,14 +1,14 @@
 ---
-title: "Codex — Delegate coding to OpenAI Codex CLI (features, PRs)"
+title: "Codex — Route managed Codex subagents; run standalone CLI sessions"
 sidebar_label: "Codex"
-description: "Delegate coding to OpenAI Codex CLI (features, PRs)"
+description: "Route managed Codex subagents; run standalone CLI sessions"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Codex
 
-Delegate coding to OpenAI Codex CLI (features, PRs).
+Route managed Codex subagents; run standalone CLI sessions.
 
 ## Skill metadata
 
@@ -16,7 +16,7 @@ Delegate coding to OpenAI Codex CLI (features, PRs).
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/autonomous-ai-agents/codex` |
-| Version | `1.0.1` |
+| Version | `1.1.0` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -31,10 +31,36 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # Codex CLI
 
-Delegate coding tasks to [Codex](https://github.com/openai/codex) via the Hermes terminal. Codex is OpenAI's autonomous coding agent CLI.
+Use [Codex](https://github.com/openai/codex) either as a Hermes-managed native
+subagent or as a standalone CLI. Codex is OpenAI's autonomous coding agent.
 
-## When to use
+## Routing precedence
 
+When the user asks to **delegate to**, **spawn**, or **use a native Codex
+subagent**, call:
+
+```
+delegate_task(runtime="codex", goal="<self-contained task>", context="<needed context>")
+```
+
+This keeps Hermes responsible for worker identity, background completion,
+steering, stopping, resume, and cleanup while Codex App Server owns the native
+thread. Do **not** replace this managed path with `codex exec`, `codex review`,
+or another `terminal` call.
+
+If the managed child reports `waiting_for_input`, ask the human with `clarify`,
+then call `delegate_task(runtime="codex", action="respond", ...)` with the exact
+subagent ID, request ID, and question IDs from the request. Never invent the
+answer. Stop the child if the human declines. Secret-input requests fail closed
+and must not be relayed through model-visible text.
+
+Use the standalone CLI instructions below only when the user explicitly asks to
+run the Codex CLI, wants a visible interactive terminal, or needs a CLI-only
+command.
+
+## When to use the standalone CLI
+
+- Explicit standalone or visible Codex CLI sessions
 - Building features
 - Refactoring
 - PR reviews
@@ -158,12 +184,19 @@ terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ```
 
-## Rules
+## Rules for standalone Codex CLI sessions
 
-1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
+1. **For standalone Codex CLI runs, always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
 2. **Git repo required** — Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch
-3. **Use `exec` for one-shots** — `codex exec "prompt"` runs and exits cleanly
+3. **For standalone one-shots, use `exec`** — `codex exec "prompt"` runs and exits cleanly
 4. **`--sandbox workspace-write` for building** — auto-approves changes within the sandbox (`--full-auto` is deprecated for this)
 5. **Background for long tasks** — use `background=true` and monitor with `process` tool
 6. **Don't interfere** — monitor with `poll`/`log`, be patient with long-running tasks
 7. **Parallel is fine** — run multiple Codex processes at once for batch work
+
+## Routing reminder
+
+For a managed Codex subagent, always call
+`delegate_task(runtime="codex", goal="...")`. The standalone rules above apply
+only when the user explicitly asks for the Codex CLI or a visible interactive
+terminal session.

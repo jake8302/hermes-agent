@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -210,6 +211,46 @@ class TestRunSingleChildTimeoutDump:
         assert "without making any API call" in result["error"]
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
+
+    def test_native_timeout_preserves_provider_session_identity(
+        self,
+        hermes_home,
+        monkeypatch,
+    ):
+        child = _StubChild(api_call_count=1, hang_seconds=10.0)
+        child.api_mode = "codex_app_server"
+        setattr(child, "_delegate_runtime", "codex")
+        setattr(
+            child,
+            "_delegate_native_config",
+            {
+                "model": "gpt-5.1-codex-max",
+                "effort": "xhigh",
+                "approval_mode": "approve_for_me",
+            },
+        )
+        setattr(
+            child,
+            "_codex_session",
+            SimpleNamespace(
+                thread_id="thread-timeout-42",
+                resolved_model="gpt-5.1-codex-max",
+                resolved_approval_policy="on-request",
+                resolved_approvals_reviewer="auto_review",
+            ),
+        )
+
+        result = self._invoke_with_short_timeout(child, monkeypatch)
+
+        assert result["status"] == "timeout"
+        assert result["runtime"] == "codex"
+        assert result["native_session_id"] == "thread-timeout-42"
+        assert result["native_model_requested"] == "gpt-5.1-codex-max"
+        assert result["native_effort_requested"] == "xhigh"
+        assert result["native_approval_mode_requested"] == "approve_for_me"
+        assert result["native_model_resolved"] == "gpt-5.1-codex-max"
+        assert "native_effort_resolved" not in result
+        assert result["native_approvals_reviewer_resolved"] == "auto_review"
 
 
     # ── explicit timeout metadata (#51690, salvaged from PR #60378) ────

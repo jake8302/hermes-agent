@@ -9,12 +9,18 @@ backgrounded) and never consume the per-turn subagent spawn cap.
 """
 
 import json
+import queue
+import threading
+import time
 import weakref
 
+import tools.delegate_tool as delegate_tool_module
+from tools.process_registry import format_process_notification, process_registry
 from tools.delegate_tool import (
     _handle_control_action,
     _is_descendant_of,
     _owns_subagent_record,
+
     _register_subagent,
     _unregister_subagent,
     delegate_task,
@@ -128,6 +134,102 @@ def test_list_shows_only_own_children():
         _unregister_subagent("sid-ctl-list-2")
 
 
+def test_list_exposes_safe_managed_native_configuration():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    child._delegate_runtime = "codex"
+    child._delegate_native_config = {
+        "model": "gpt-5.1-codex-max",
+        "effort": "xhigh",
+        "approval_mode": "approve_for_me",
+    }
+    child._codex_session = type(
+        "NativeSession",
+        (),
+        {
+            "resolved_model": "gpt-5.1-codex-max",
+            "resolved_approval_policy": "on-request",
+            "resolved_approvals_reviewer": "auto_review",
+        },
+    )()
+    _register("sid-ctl-native", child)
+    try:
+        entry = json.loads(
+            _handle_control_action("list", None, None, parent)
+        )["subagents"][0]
+        assert entry["runtime"] == "codex"
+        assert entry["native_model_requested"] == "gpt-5.1-codex-max"
+        assert entry["native_effort_requested"] == "xhigh"
+        assert entry["native_approval_mode_requested"] == "approve_for_me"
+        assert entry["native_model_resolved"] == "gpt-5.1-codex-max"
+        assert "native_effort_resolved" not in entry
+        assert entry["native_approvals_reviewer_resolved"] == "auto_review"
+    finally:
+        _unregister_subagent("sid-ctl-native")
+
+
+def test_list_exposes_only_observed_claude_model_as_resolved():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    setattr(child, "_delegate_runtime", "claude-code")
+    setattr(
+        child,
+        "_delegate_native_config",
+        {
+            "model": "claude-requested-alias",
+            "effort": "xhigh",
+            "approval_mode": "auto",
+        },
+    )
+    setattr(
+        child,
+        "_claude_sdk_session",
+        type(
+            "ClaudeNativeSession",
+            (),
+            {"resolved_model": "claude-observed-model"},
+        )(),
+    )
+    _register("sid-ctl-native-claude", child)
+    try:
+        entry = json.loads(
+            _handle_control_action("list", None, None, parent)
+        )["subagents"][0]
+        assert entry["runtime"] == "claude-code"
+        assert entry["native_model_requested"] == "claude-requested-alias"
+        assert entry["native_model_resolved"] == "claude-observed-model"
+        assert entry["native_effort_requested"] == "xhigh"
+        assert entry["native_approval_mode_requested"] == "auto"
+        assert "native_effort_resolved" not in entry
+    finally:
+        _unregister_subagent("sid-ctl-native-claude")
+
+
+def test_list_drops_unsafe_provider_resolved_metadata():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    setattr(child, "_delegate_runtime", "claude-code")
+    setattr(child, "_delegate_native_config", {"model": "safe-requested-model"})
+    setattr(
+        child,
+        "_claude_sdk_session",
+        type(
+            "ClaudeNativeSession",
+            (),
+            {"resolved_model": "safe\u202eevil"},
+        )(),
+    )
+    _register("sid-ctl-native-unsafe", child)
+    try:
+        entry = json.loads(
+            _handle_control_action("list", None, None, parent)
+        )["subagents"][0]
+        assert entry["native_model_requested"] == "safe-requested-model"
+        assert "native_model_resolved" not in entry
+    finally:
+        _unregister_subagent("sid-ctl-native-unsafe")
+
+
 def test_list_empty_registry_has_note():
     out = json.loads(_handle_control_action("list", None, None, _StubParent()))
     assert out["count"] == 0
@@ -151,6 +253,188 @@ def test_steer_reaches_owned_child():
         assert child.steered == ["focus on X"]
     finally:
         _unregister_subagent("sid-ctl-steer-1")
+
+
+def test_steer_native_child_reports_starting_before_provider_session_exists():
+    parent = _StubParent()
+    child = _StubChild(parent, accept_steer=False)
+    setattr(child, "api_mode", "codex_app_server")
+    setattr(child, "_codex_session", None)
+    _register("sid-ctl-steer-starting", child)
+    try:
+        out = json.loads(
+            _handle_control_action(
+                "steer",
+                "sid-ctl-steer-starting",
+                "focus on X",
+                parent,
+            )
+        )
+        assert out["status"] == "starting"
+        assert out["retryable"] is True
+        assert child.steered == []
+    finally:
+        _unregister_subagent("sid-ctl-steer-starting")
+
+
+def test_respond_unblocks_owned_child_waiting_for_input(monkeypatch):
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-input-1"
+    _register(sid, child)
+    completion_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", completion_queue)
+    result = {}
+
+    def wait_for_answer():
+        result["answers"] = getattr(
+            delegate_tool_module,
+            "_request_subagent_input",
+        )(
+            sid,
+            {
+                "provider": "codex",
+                "questions": [
+                    {
+                        "id": "framework",
+                        "header": "Framework",
+                        "question": "Which framework?",
+                        "options": [
+                            {"label": "React", "description": "Use React"},
+                        ],
+                        "is_secret": False,
+                        "unknown": "must not leak",
+                    }
+                ],
+            },
+        )
+
+    worker = threading.Thread(target=wait_for_answer)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        listed = None
+        while time.monotonic() < deadline:
+            listed = json.loads(_handle_control_action("list", None, None, parent))
+            if listed["subagents"][0]["status"] == "waiting_for_input":
+                break
+            time.sleep(0.01)
+        assert listed is not None
+        entry = listed["subagents"][0]
+        assert entry["status"] == "waiting_for_input"
+        request = entry["input_request"]
+        assert "unknown" not in str(request)
+        event = completion_queue.get_nowait()
+        assert event["type"] == "async_delegation_input"
+        assert event["subagent_id"] == sid
+        assert event["request_id"] == request["request_id"]
+        text = format_process_notification(event)
+        assert isinstance(text, str)
+        assert "SUBAGENT INPUT REQUIRED" in text
+        assert "Which framework?" in text
+        assert "clarify" in text
+        assert "delegate_task(runtime='codex', action='respond')" in text
+        assert "must not leak" not in text
+
+        responded = json.loads(
+            delegate_task(
+                action="respond",
+                runtime="hermes",
+                subagent_id=sid,
+                request_id=request["request_id"],
+                answers={
+                    "framework": ["React"],
+                    "not-asked": ["must not pass through"],
+                },
+                parent_agent=parent,
+            )
+        )
+        assert responded["status"] == "answered"
+        worker.join(timeout=2.0)
+        assert worker.is_alive() is False
+        assert result["answers"] == {"framework": ["React"]}
+    finally:
+        _unregister_subagent(sid)
+        worker.join(timeout=2.0)
+
+
+def test_stop_cancels_child_waiting_for_input(monkeypatch):
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-input-stop"
+    _register(sid, child)
+    result = {}
+    monkeypatch.setattr(
+        delegate_tool_module,
+        "request_hard_interrupt",
+        lambda agent, reason: True,
+    )
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "answers",
+            getattr(delegate_tool_module, "_request_subagent_input")(
+                sid,
+                {
+                    "provider": "claude-code",
+                    "questions": [
+                        {
+                            "id": "question_0",
+                            "question": "Continue?",
+                            "options": [],
+                            "is_secret": False,
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            listed = json.loads(_handle_control_action("list", None, None, parent))
+            if listed["subagents"][0]["status"] == "waiting_for_input":
+                break
+            time.sleep(0.01)
+
+        stopped = json.loads(_handle_control_action("stop", sid, None, parent))
+        assert stopped["status"] == "interrupt_requested"
+        worker.join(timeout=2.0)
+        assert worker.is_alive() is False
+        assert result["answers"] is None
+    finally:
+        _unregister_subagent(sid)
+        worker.join(timeout=2.0)
+
+
+def test_respond_accepts_exactly_once_and_requires_a_known_question_id():
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-input-once"
+    _register(sid, child)
+    waiter = {
+        "event": threading.Event(),
+        "answers": None,
+        "cancelled": False,
+        "request_id": "input-once",
+    }
+    try:
+        with delegate_tool_module._active_subagents_lock:
+            record = delegate_tool_module._active_subagents[sid]
+            record["_input_waiter"] = waiter
+            record["input_request"] = {
+                "request_id": "input-once",
+                "questions": [{"id": "framework", "question": "Which?"}],
+            }
+
+        respond = getattr(delegate_tool_module, "_respond_subagent_input")
+        assert respond(sid, "input-once", {"not-asked": ["Vue"]}) is False
+        assert respond(sid, "input-once", {"framework": ["React"]}) is True
+        assert respond(sid, "input-once", {"framework": ["Vue"]}) is False
+        assert waiter["answers"] == {"framework": ["React"]}
+    finally:
+        _unregister_subagent(sid)
 
 
 def test_steer_foreign_child_is_refused():

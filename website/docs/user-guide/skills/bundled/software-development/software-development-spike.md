@@ -138,14 +138,14 @@ spikes/
 terminal("mkdir -p spikes/001-websocket-streaming")
 write_file("spikes/001-websocket-streaming/README.md", "# 001: websocket-streaming\n\n...")
 write_file("spikes/001-websocket-streaming/main.py", "...")
-terminal("cd spikes/001-websocket-streaming && python3 main.py")
+terminal("cd spikes/001-websocket-streaming && python main.py")
 # Observe output, iterate.
 ```
 
 **Parallel comparison spikes (002a / 002b) — delegate.** When two approaches can run in parallel and both need real engineering (not 10-line prototypes), fan out with `delegate_task`:
 
 ```
-delegate_task(tasks=[
+delegate_task(runtime="hermes", tasks=[
     {"goal": "Build 002a-pdf-parse-pdfjs: ...", "toolsets": ["terminal", "file", "web"]},
     {"goal": "Build 002b-pdf-parse-camelot: ...", "toolsets": ["terminal", "file", "web"]},
 ])

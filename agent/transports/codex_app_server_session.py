@@ -70,6 +70,7 @@ class TurnResult:
     tool_iterations: int = 0
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
+    approval_denials: list[dict[str, str]] = field(default_factory=list)
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
@@ -277,8 +278,17 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        resume_thread_id: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        approvals_reviewer: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        input_callback: Optional[
+            Callable[[dict[str, Any]], Optional[dict[str, list[str]]]]
+        ] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
@@ -286,6 +296,14 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._resume_thread_id = resume_thread_id
+        self._developer_instructions = (
+            str(developer_instructions).strip() if developer_instructions else None
+        )
+        self._model = model
+        self._effort = effort
+        self._approval_policy = approval_policy
+        self._approvals_reviewer = approvals_reviewer
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -293,12 +311,17 @@ class CodexAppServerSession:
             )
         )
         self._approval_callback = approval_callback
+        self._input_callback = input_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._resolved_model: Optional[str] = None
+        self._resolved_effort: Optional[str] = None
+        self._resolved_approval_policy: Optional[str] = None
+        self._resolved_approvals_reviewer: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -309,6 +332,27 @@ class CodexAppServerSession:
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+
+    @property
+    def thread_id(self) -> Optional[str]:
+        """Opaque Codex thread identity for persistence and resume."""
+        return self._thread_id
+
+    @property
+    def resolved_model(self) -> Optional[str]:
+        return self._resolved_model
+
+    @property
+    def resolved_effort(self) -> Optional[str]:
+        return self._resolved_effort
+
+    @property
+    def resolved_approval_policy(self) -> Optional[str]:
+        return self._resolved_approval_policy
+
+    @property
+    def resolved_approvals_reviewer(self) -> Optional[str]:
+        return self._resolved_approvals_reviewer
 
     # ---------- lifecycle ----------
 
@@ -322,10 +366,15 @@ class CodexAppServerSession:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
+        initialize_kwargs: dict[str, Any] = {
+            "client_name": "hermes",
+            "client_title": "Hermes Agent",
+            "client_version": _get_hermes_version(),
+        }
+        if self._input_callback is not None:
+            initialize_kwargs["capabilities"] = {"experimentalApi": True}
         self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
-            client_version=_get_hermes_version(),
+            **initialize_kwargs,
         )
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
@@ -342,8 +391,49 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        if self._resume_thread_id:
+            method = "thread/resume"
+            params: dict[str, Any] = {
+                "threadId": self._resume_thread_id,
+                "cwd": self._cwd,
+            }
+        else:
+            method = "thread/start"
+            params = {"cwd": self._cwd}
+        if self._model:
+            params["model"] = self._model
+        if self._approval_policy:
+            params["approvalPolicy"] = self._approval_policy
+        if self._approvals_reviewer:
+            params["approvalsReviewer"] = self._approvals_reviewer
+        if self._developer_instructions:
+            params["developerInstructions"] = self._developer_instructions
+        if self._input_callback is not None and method == "thread/start":
+            params["dynamicTools"] = [
+                {
+                    "type": "function",
+                    "name": "ask_user",
+                    "description": (
+                        "Ask the parent human one non-secret question when their "
+                        "decision is required. Do not guess the answer."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string"},
+                            "options": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 6,
+                            },
+                            "multi_select": {"type": "boolean"},
+                        },
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        result = self._client.request(method, params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -364,6 +454,16 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        self._resolved_model = result.get("model")
+        # reasoningEffort here describes the thread default. A managed effort
+        # override is applied later on turn/start, whose response does not echo
+        # the resolved effort. Do not misreport the thread default as the turn's
+        # resolved setting.
+        self._resolved_effort = (
+            None if self._effort else result.get("reasoningEffort")
+        )
+        self._resolved_approval_policy = result.get("approvalPolicy")
+        self._resolved_approvals_reviewer = result.get("approvalsReviewer")
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
             self._thread_id[:8],
@@ -471,7 +571,7 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: Optional[float] = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
@@ -518,13 +618,22 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        turn_params: dict[str, Any] = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_input_text}],
+        }
+        if self._model:
+            turn_params["model"] = self._model
+        if self._effort:
+            turn_params["effort"] = self._effort
+        if self._approval_policy:
+            turn_params["approvalPolicy"] = self._approval_policy
+        if self._approvals_reviewer:
+            turn_params["approvalsReviewer"] = self._approvals_reviewer
         try:
             ts = self._client.request(
                 "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
+                turn_params,
                 timeout=10,
             )
         except CodexAppServerError as exc:
@@ -559,7 +668,11 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+        deadline = (
+            time.monotonic() + turn_timeout
+            if turn_timeout is not None
+            else None
+        )
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -567,7 +680,7 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while (deadline is None or time.monotonic() < deadline) and not turn_complete:
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -663,7 +776,7 @@ class CodexAppServerSession:
                                 result.error
                                 or "codex reported turn_aborted"
                             )
-                self._handle_server_request(sreq)
+                self._handle_server_request(sreq, result)
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
                 last_tool_completion_at = None
@@ -770,7 +883,7 @@ class CodexAppServerSession:
             )
             turn_complete = True
 
-        if not turn_complete and not result.interrupted:
+        if deadline is not None and not turn_complete and not result.interrupted:
             # Hit the deadline. Issue interrupt to stop wasted compute, and
             # tell the caller to retire the session — a turn that never
             # finished is a strong sign codex is wedged in a way the next
@@ -866,7 +979,7 @@ class CodexAppServerSession:
 
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
-                self._handle_server_request(sreq)
+                self._handle_server_request(sreq, result)
                 continue
 
             note = self._client.take_notification(
@@ -995,7 +1108,11 @@ class CodexAppServerSession:
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
 
-    def _handle_server_request(self, req: dict) -> None:
+    def _handle_server_request(
+        self,
+        req: dict,
+        result: Optional[TurnResult] = None,
+    ) -> None:
         """Translate a codex server request (approval) into Hermes' approval
         flow, then send the response.
 
@@ -1013,18 +1130,161 @@ class CodexAppServerSession:
         rid = req.get("id")
         params = req.get("params") or {}
 
-        if method == "item/commandExecution/requestApproval":
+        if method == "item/tool/call" and params.get("tool") == "ask_user":
+            if self._input_callback is None:
+                self._client.respond_error(
+                    rid,
+                    code=-32601,
+                    message="Hermes has no input callback for this session",
+                )
+                return
+            arguments = params.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            question_text = str(arguments.get("question") or "")[:1000]
+            options = []
+            raw_options = arguments.get("options")
+            if isinstance(raw_options, list):
+                for raw_option in raw_options[:6]:
+                    label = str(raw_option)[:200]
+                    if label:
+                        options.append({"label": label, "description": ""})
+            try:
+                raw_answers = self._input_callback(
+                    {
+                        "provider": "codex",
+                        "questions": [
+                            {
+                                "id": "answer",
+                                "header": "Question",
+                                "question": question_text,
+                                "options": options,
+                                "is_secret": False,
+                                "multi_select": bool(arguments.get("multi_select")),
+                            }
+                        ],
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Codex ask_user callback failed: %s", exc)
+                raw_answers = None
+            answer_values = []
+            if isinstance(raw_answers, dict):
+                raw_values = raw_answers.get("answer")
+                if isinstance(raw_values, list):
+                    answer_values = [str(value)[:1000] for value in raw_values[:10]]
+            answer_text = ", ".join(value for value in answer_values if value)
+            self._client.respond(
+                rid,
+                {
+                    "success": bool(answer_text),
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": answer_text or "No answer was provided.",
+                        }
+                    ],
+                },
+            )
+            return
+
+        if method == "item/tool/requestUserInput":
+            if self._input_callback is None:
+                self._client.respond_error(
+                    rid,
+                    code=-32601,
+                    message="Hermes has no input callback for this session",
+                )
+                return
+            questions = []
+            allowed_ids = set()
+            for raw_question in (params.get("questions") or [])[:8]:
+                if not isinstance(raw_question, dict):
+                    continue
+                question_id = str(raw_question.get("id") or "")[:128]
+                question_text = str(raw_question.get("question") or "")[:2000]
+                if not question_id or not question_text:
+                    continue
+                allowed_ids.add(question_id)
+                options = []
+                for raw_option in (raw_question.get("options") or [])[:8]:
+                    if not isinstance(raw_option, dict):
+                        continue
+                    options.append(
+                        {
+                            "label": str(raw_option.get("label") or "")[:200],
+                            "description": str(
+                                raw_option.get("description") or ""
+                            )[:500],
+                        }
+                    )
+                questions.append(
+                    {
+                        "id": question_id,
+                        "header": str(raw_question.get("header") or "")[:200],
+                        "question": question_text,
+                        "options": options,
+                        "is_secret": bool(raw_question.get("isSecret", False)),
+                    }
+                )
+            try:
+                raw_answers = self._input_callback(
+                    {"provider": "codex", "questions": questions}
+                )
+            except Exception:
+                logger.exception("input_callback raised on Codex user input request")
+                self._client.respond_error(
+                    rid,
+                    code=-32603,
+                    message="Hermes input callback failed",
+                )
+                return
+            safe_answers: dict[str, dict[str, list[str]]] = {}
+            if isinstance(raw_answers, dict):
+                for question_id, values in raw_answers.items():
+                    question_id = str(question_id)
+                    if question_id not in allowed_ids or not isinstance(values, list):
+                        continue
+                    safe_answers[question_id] = {
+                        "answers": [str(value)[:2000] for value in values[:8]]
+                    }
+            self._client.respond(rid, {"answers": safe_answers})
+        elif method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
+            if result is not None and decision == "decline":
+                result.approval_denials.append(
+                    {
+                        "provider": "codex",
+                        "kind": "command",
+                        "reason": "Hermes approval policy denied the request",
+                    }
+                )
         elif method == "item/fileChange/requestApproval":
             decision = self._decide_apply_patch_approval(params)
             self._client.respond(rid, {"decision": decision})
+            if result is not None and decision == "decline":
+                result.approval_denials.append(
+                    {
+                        "provider": "codex",
+                        "kind": "file_change",
+                        "reason": "Hermes approval policy denied the request",
+                    }
+                )
         elif method == "item/permissions/requestApproval":
             # Codex sometimes asks to escalate permissions mid-turn. We
             # always decline — the user already chose their permission
             # profile in ~/.codex/config.toml and surprise escalations
             # shouldn't be silently accepted.
             self._client.respond(rid, {"decision": "decline"})
+            if result is not None:
+                result.approval_denials.append(
+                    {
+                        "provider": "codex",
+                        "kind": "permissions",
+                        "reason": "Hermes approval policy denied the request",
+                    }
+                )
         elif method == "mcpServer/elicitation/request":
             # Codex's MCP layer asks the user for structured input on
             # behalf of an MCP server (e.g. tool-call confirmation,
@@ -1045,6 +1305,14 @@ class CodexAppServerSession:
                     rid,
                     {"action": "decline", "content": None, "_meta": None},
                 )
+                if result is not None:
+                    result.approval_denials.append(
+                        {
+                            "provider": "codex",
+                            "kind": "mcp_elicitation",
+                            "reason": "Hermes approval policy denied the request",
+                        }
+                    )
         else:
             # Unknown server request — codex can extend this surface. Reject
             # cleanly so codex doesn't hang waiting for us.

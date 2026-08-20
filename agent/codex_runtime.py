@@ -695,6 +695,20 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    native_config = getattr(agent, "_delegate_native_config", None)
+    if not isinstance(native_config, dict):
+        native_config = {}
+    requested_native_metadata = {
+        key: value
+        for key, value in {
+            "native_model_requested": native_config.get("model"),
+            "native_effort_requested": native_config.get("effort"),
+            "native_approval_mode_requested": native_config.get("approval_mode"),
+        }.items()
+        if isinstance(value, str) and value
+    }
+    approve_for_me = native_config.get("approval_mode") == "approve_for_me"
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -741,7 +755,18 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            resume_thread_id=getattr(agent, "_native_resume_session_id", None),
+            model=native_config.get("model"),
+            effort=native_config.get("effort"),
+            approval_policy="on-request" if approve_for_me else None,
+            approvals_reviewer="auto_review" if approve_for_me else None,
+            developer_instructions=(
+                getattr(agent, "ephemeral_system_prompt", None)
+                if getattr(agent, "_delegate_runtime", None) == "codex"
+                else None
+            ),
             approval_callback=approval_callback,
+            input_callback=getattr(agent, "_delegate_input_callback", None),
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
@@ -754,9 +779,38 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        _run_turn_kwargs: Dict[str, Any] = {"user_input": user_message}
+        if getattr(agent, "_delegate_runtime", None) == "codex":
+            # _run_single_child already applies delegation.child_timeout_seconds
+            # around this call. A second fixed 600s transport deadline made long
+            # native tasks fail even when Hermes was configured to allow them.
+            _run_turn_kwargs["turn_timeout"] = None
+        turn = agent._codex_session.run_turn(**_run_turn_kwargs)
+        active_codex_session = agent._codex_session
+        resolved_native_metadata = {
+            key: value
+            for key, value in {
+                "native_model_resolved": getattr(
+                    active_codex_session, "resolved_model", None
+                ),
+                "native_effort_resolved": getattr(
+                    active_codex_session, "resolved_effort", None
+                ),
+                "native_approval_policy_resolved": getattr(
+                    active_codex_session, "resolved_approval_policy", None
+                ),
+                "native_approvals_reviewer_resolved": getattr(
+                    active_codex_session, "resolved_approvals_reviewer", None
+                ),
+            }.items()
+            if isinstance(value, str) and value
+        }
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        native_session_id = (
+            getattr(agent._codex_session, "thread_id", None)
+            or getattr(agent, "_native_resume_session_id", None)
+        )
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -784,6 +838,9 @@ def run_codex_app_server_turn(
             "completed": False,
             "partial": True,
             "interrupted": _user_interrupted,
+            "native_runtime": "codex",
+            "native_session_id": native_session_id,
+            **requested_native_metadata,
             **(
                 {"interrupt_message": _interrupt_message}
                 if _interrupt_message
@@ -948,6 +1005,9 @@ def run_codex_app_server_turn(
         "agent_persisted": True,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        "approval_denials": list(turn.approval_denials),
+        **requested_native_metadata,
+        **resolved_native_metadata,
         **usage_result,
     }
 

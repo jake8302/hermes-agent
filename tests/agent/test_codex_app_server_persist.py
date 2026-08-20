@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -43,6 +43,7 @@ def _make_turn():
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
         should_retire=False,
+        approval_denials=[],
     )
 
 
@@ -77,6 +78,85 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_delegation_context_reaches_native_thread_instructions():
+    agent = _make_agent(session_db=None)
+    agent._codex_session = None
+    agent._delegate_runtime = "codex"
+    agent.ephemeral_system_prompt = "DELEGATION_CONTEXT_MARKER"
+    agent.session_cwd = "/tmp"
+    input_callback = MagicMock()
+    agent._delegate_input_callback = input_callback
+
+    with patch(
+        "agent.transports.codex_app_server_session.CodexAppServerSession"
+    ) as session_cls:
+        session_cls.return_value.run_turn.return_value = _make_turn()
+        run_codex_app_server_turn(
+            agent,
+            user_message="first task",
+            original_user_message="first task",
+            messages=[{"role": "user", "content": "first task"}],
+            effective_task_id="task-1",
+        )
+
+    assert (
+        session_cls.call_args.kwargs["developer_instructions"]
+        == "DELEGATION_CONTEXT_MARKER"
+    )
+    assert session_cls.call_args.kwargs["input_callback"] is input_callback
+    assert agent._codex_session.run_turn.call_args.kwargs["user_input"] == "first task"
+
+
+def test_codex_delegation_builds_session_from_managed_native_config():
+    agent = _make_agent(session_db=None)
+    agent._codex_session = None
+    agent._delegate_runtime = "codex"
+    agent._delegate_native_config = {
+        "model": "gpt-5.1-codex-max",
+        "effort": "xhigh",
+        "approval_mode": "approve_for_me",
+    }
+    agent.ephemeral_system_prompt = "context"
+    agent.session_cwd = "/tmp"
+
+    with patch(
+        "agent.transports.codex_app_server_session.CodexAppServerSession"
+    ) as session_cls:
+        session_cls.return_value.run_turn.return_value = _make_turn()
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="first task",
+            original_user_message="first task",
+            messages=[{"role": "user", "content": "first task"}],
+            effective_task_id="task-1",
+        )
+
+    kwargs = session_cls.call_args.kwargs
+    assert kwargs["model"] == "gpt-5.1-codex-max"
+    assert kwargs["effort"] == "xhigh"
+    assert kwargs["approval_policy"] == "on-request"
+    assert kwargs["approvals_reviewer"] == "auto_review"
+    assert result["native_model_requested"] == "gpt-5.1-codex-max"
+    assert result["native_effort_requested"] == "xhigh"
+    assert result["native_approval_mode_requested"] == "approve_for_me"
+
+
+def test_codex_delegation_uses_hermes_child_timeout_only():
+    agent = _make_agent(session_db=None)
+    agent._delegate_runtime = "codex"
+    agent.ephemeral_system_prompt = "context"
+
+    run_codex_app_server_turn(
+        agent,
+        user_message="long task",
+        original_user_message="long task",
+        messages=[{"role": "user", "content": "long task"}],
+        effective_task_id="task-1",
+    )
+
+    assert agent._codex_session.run_turn.call_args.kwargs["turn_timeout"] is None
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()
@@ -103,6 +183,48 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert result["interrupt_message"] == "new correction"
     agent.clear_interrupt.assert_called_once_with()
     assert agent._interrupt_requested is False
+
+
+def test_codex_failed_turn_preserves_native_thread_identity():
+    agent = _make_agent(session_db=None)
+    agent._delegate_runtime = "codex"
+    agent._codex_session.thread_id = "thread-failed-42"
+    agent._codex_session.run_turn.side_effect = RuntimeError("app server died")
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="work",
+        original_user_message="work",
+        messages=[{"role": "user", "content": "work"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["completed"] is False
+    assert result["native_runtime"] == "codex"
+    assert result["native_session_id"] == "thread-failed-42"
+
+
+def test_codex_turn_exposes_sanitized_approval_denials():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.approval_denials = [
+        {
+            "provider": "codex",
+            "kind": "command",
+            "reason": "Hermes approval policy denied the request",
+        }
+    ]
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="work",
+        original_user_message="work",
+        messages=[{"role": "user", "content": "work"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["approval_denials"] == turn.approval_denials
 
 
 def test_codex_turn_persists_each_message_exactly_once():

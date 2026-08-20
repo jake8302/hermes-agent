@@ -1,14 +1,14 @@
 ---
-title: "Claude Code — Delegate coding to Claude Code CLI (features, PRs)"
+title: "Claude Code — Route managed Claude subagents; run standalone CLI sessions"
 sidebar_label: "Claude Code"
-description: "Delegate coding to Claude Code CLI (features, PRs)"
+description: "Route managed Claude subagents; run standalone CLI sessions"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Claude Code
 
-Delegate coding to Claude Code CLI (features, PRs).
+Route managed Claude subagents; run standalone CLI sessions.
 
 ## Skill metadata
 
@@ -16,7 +16,7 @@ Delegate coding to Claude Code CLI (features, PRs).
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/autonomous-ai-agents/claude-code` |
-| Version | `2.2.1` |
+| Version | `2.2.2` |
 | Author | Hermes Agent + Teknium |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -31,7 +31,31 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # Claude Code — Hermes Orchestration Guide
 
-Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-reference) (Anthropic's autonomous coding agent CLI) via the Hermes terminal. Claude Code v2.x can read files, write code, run shell commands, spawn subagents, and manage git workflows autonomously.
+Use [Claude Code](https://code.claude.com/docs/en/cli-reference) either as a Hermes-managed native subagent or as a standalone CLI. Claude Code v2.x can read files, write code, run shell commands, spawn subagents, and manage git workflows autonomously.
+
+## Routing precedence
+
+When the user asks to **delegate to**, **spawn**, or **use a native Claude Code
+subagent**, call:
+
+```
+delegate_task(runtime="claude-code", goal="<self-contained task>", context="<needed context>")
+```
+
+This keeps Hermes responsible for worker identity, background completion,
+steering, stopping, resume, and cleanup while the Claude Agent SDK owns the
+native Claude Code session. Do **not** replace this managed path with `claude -p`,
+tmux, or another `terminal` call.
+
+If the managed child reports `waiting_for_input`, ask the human with `clarify`,
+then call `delegate_task(runtime="claude-code", action="respond", ...)` with the
+exact subagent ID, request ID, and question IDs from the request. Never invent
+the answer. Stop the child if the human declines. Secret-input requests fail
+closed and must not be relayed through model-visible text.
+
+Use the standalone CLI instructions below only when the user explicitly asks to
+run the Claude CLI, wants a visible interactive terminal, or needs a CLI-only
+feature such as an interactive slash command.
 
 ## Prerequisites
 
@@ -44,13 +68,13 @@ Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-refer
 - **Version check:** `claude --version` (requires v2.x+)
 - **Update:** `claude update` or `claude upgrade`
 
-## Two Orchestration Modes
+## Standalone CLI orchestration modes
 
-Hermes interacts with Claude Code in two fundamentally different ways. Choose based on the task.
+For an explicitly standalone or visible Claude CLI session, choose based on the task.
 
-### Mode 1: Print Mode (`-p`) — Non-Interactive (PREFERRED for most tasks)
+### Mode 1: Print Mode (`-p`) — Non-Interactive
 
-Print mode runs a one-shot task, returns the result, and exits. No PTY needed. No interactive prompts. This is the cleanest integration path.
+Print mode runs a one-shot standalone CLI task, returns the result, and exits. No PTY needed. No interactive prompts.
 
 ```
 terminal(command="claude -p 'Add error handling to all API calls in src/' --allowedTools 'Read,Edit' --max-turns 10", workdir="/path/to/project", timeout=120)
@@ -230,7 +254,7 @@ Parse `structured_output` from the JSON result. Claude validates output against 
 terminal(command="claude -p 'Start refactoring the database layer' --output-format json --max-turns 10 > /tmp/session.json", workdir="/project", timeout=180)
 
 # Resume with session ID
-terminal(command="claude -p 'Continue and add connection pooling' --resume $(cat /tmp/session.json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"session_id\"])') --max-turns 5", workdir="/project", timeout=120)
+terminal(command="claude -p 'Continue and add connection pooling' --resume $(cat /tmp/session.json | python -c 'import json,sys; print(json.load(sys.stdin)[\"session_id\"])') --max-turns 5", workdir="/project", timeout=120)
 
 # Or resume the most recent session in the same directory
 terminal(command="claude -p 'What did you do last time?' --continue --max-turns 1", workdir="/project", timeout=30)
@@ -740,7 +764,7 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 2. **`--dangerously-skip-permissions` dialog defaults to "No, exit"** — you must send Down then Enter to accept. Print mode (`-p`) skips this entirely.
 3. **`--max-budget-usd` minimum is ~$0.05** — system prompt cache creation alone costs this much. Setting lower will error immediately.
 4. **`--max-turns` is print-mode only** — ignored in interactive sessions.
-5. **Claude may use `python` instead of `python3`** — on systems without a `python` symlink, Claude's bash commands will fail on first try but it self-corrects.
+5. **Claude may use `python` instead of `python`** — on systems without a `python` symlink, Claude's bash commands will fail on first try but it self-corrects.
 6. **Session resumption requires same directory** — `--continue` finds the most recent session for the current working directory.
 7. **`--json-schema` needs enough `--max-turns`** — Claude must read files before producing structured output, which takes multiple turns.
 8. **Trust dialog only appears once per directory** — first-time only, then cached.
@@ -749,9 +773,9 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 11. **`--bare` skips OAuth** — requires `ANTHROPIC_API_KEY` env var or an `apiKeyHelper` in settings.
 12. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
 
-## Rules for Hermes Agents
+## Rules for standalone Claude CLI sessions
 
-1. **Prefer print mode (`-p`) for single tasks** — cleaner, no dialog handling, structured output
+1. **For standalone one-shot tasks, prefer print mode (`-p`)** — cleaner, no dialog handling, structured output
 2. **Use tmux for multi-turn interactive work** — the only reliable way to orchestrate the TUI
 3. **Always set `workdir`** — keep Claude focused on the right project directory
 4. **Set `--max-turns` in print mode** — prevents infinite loops and runaway costs
@@ -761,3 +785,10 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 8. **Report results to user** — after completion, summarize what Claude did and what changed
 9. **Don't kill slow sessions** — Claude may be doing multi-step work; check progress instead
 10. **Use `--allowedTools`** — restrict capabilities to what the task actually needs
+
+## Routing reminder
+
+For a managed Claude Code subagent, always call
+`delegate_task(runtime="claude-code", goal="...")`. The standalone rules above
+apply only when the user explicitly asks for the Claude CLI or a visible
+interactive terminal session.
