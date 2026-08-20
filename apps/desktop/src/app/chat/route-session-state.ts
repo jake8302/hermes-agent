@@ -8,8 +8,8 @@ import type { SessionInfo } from '@/types/hermes'
  * tip while the durable URL intentionally stays on the root. Those ids are
  * different strings but still the same conversation, so a loaded lineage row
  * must win over the raw comparison. An unknown route remains a mismatch: that
- * is the real navigation case where the old transcript/composer must hide
- * until resume finishes.
+ * is the real navigation case where the old transcript and interactive
+ * composer must hide until resume finishes; only its inert footprint remains.
  */
 export function isRouteSessionMismatch(
   routedSessionId: null | string,

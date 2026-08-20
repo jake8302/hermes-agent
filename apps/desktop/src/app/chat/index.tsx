@@ -500,6 +500,10 @@ const ChatViewContent = memo(function ChatViewContent({
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+  // Keep the composer's footprint mounted while a session hydrates so the
+  // transcript does not expand and contract around it. The real composer still
+  // waits for showChatBar; loading only gets its non-interactive fallback.
+  const showComposerFooter = !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
@@ -620,7 +624,7 @@ const ChatViewContent = memo(function ChatViewContent({
           {...dropHandlers}
         >
           <Thread
-            clampToComposer={showChatBar}
+            clampToComposer={showComposerFooter}
             cwd={currentCwd}
             gateway={gateway}
             intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
@@ -673,35 +677,38 @@ const ChatViewContent = memo(function ChatViewContent({
             anchors to the outer relative container instead: docked is absolute
             (identical placement), floating resolves against the viewport. Both
             states stay mounted here, so dock⇄float never remounts the editor. */}
-        {showChatBar && (
-          <Suspense fallback={<ChatBarFallback />}>
-            <ChatBar
-              busy={busy}
-              cwd={currentCwd}
-              disabled={!gatewayOpen}
-              focusKey={activeSessionId}
-              gateway={gateway}
-              maxRecordingSeconds={maxVoiceRecordingSeconds}
-              onAddContextRef={onAddContextRef}
-              onAddUrl={onAddUrl}
-              onAttachDroppedItems={onAttachDroppedItems}
-              onAttachImageBlob={onAttachImageBlob}
-              onAttachPrCommentUrl={onAttachPrCommentUrl}
-              onCancel={onCancel}
-              onPasteClipboardImage={onPasteClipboardImage}
-              onPickFiles={onPickFiles}
-              onPickFolders={onPickFolders}
-              onPickImages={onPickImages}
-              onRemoveAttachment={onRemoveAttachment}
-              onSteer={onSteer}
-              onSubmit={onSubmit}
-              onTranscribeAudio={onTranscribeAudio}
-              queueSessionKey={queueSessionKey}
-              sessionId={activeSessionId}
-              state={chatBarState}
-            />
-          </Suspense>
-        )}
+        {showComposerFooter &&
+          (showChatBar ? (
+            <Suspense fallback={<ChatBarFallback />}>
+              <ChatBar
+                busy={busy}
+                cwd={currentCwd}
+                disabled={!gatewayOpen}
+                focusKey={activeSessionId}
+                gateway={gateway}
+                maxRecordingSeconds={maxVoiceRecordingSeconds}
+                onAddContextRef={onAddContextRef}
+                onAddUrl={onAddUrl}
+                onAttachDroppedItems={onAttachDroppedItems}
+                onAttachImageBlob={onAttachImageBlob}
+                onAttachPrCommentUrl={onAttachPrCommentUrl}
+                onCancel={onCancel}
+                onPasteClipboardImage={onPasteClipboardImage}
+                onPickFiles={onPickFiles}
+                onPickFolders={onPickFolders}
+                onPickImages={onPickImages}
+                onRemoveAttachment={onRemoveAttachment}
+                onSteer={onSteer}
+                onSubmit={onSubmit}
+                onTranscribeAudio={onTranscribeAudio}
+                queueSessionKey={queueSessionKey}
+                sessionId={activeSessionId}
+                state={chatBarState}
+              />
+            </Suspense>
+          ) : (
+            <ChatBarFallback />
+          ))}
       </ChatRuntimeBoundary>
     </div>
   )

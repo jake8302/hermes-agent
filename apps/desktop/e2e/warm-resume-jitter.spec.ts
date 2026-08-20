@@ -393,6 +393,71 @@ test('tab reactivation preserves the mounted transcript without repainting', asy
   assertNoRepaint(result)
 })
 
+test('session switch keeps the composer mounted while the transcript hydrates', async () => {
+  // Earlier tests warm the shared session; use a fresh renderer so this click
+  // must hydrate a cold route in both focused and full-file runs.
+  await fixture!.cleanup()
+  fixture = await setupSeededMockBackend()
+  await waitForAppReady(fixture, 120_000)
+
+  const page = fixture.page
+
+  const sessionRow = page
+    .locator('[data-slot="sidebar"] button')
+    .filter({ hasText: SESSION_TITLE })
+    .first()
+
+  await sessionRow.waitFor({ state: 'visible', timeout: 60_000 })
+
+  await page.evaluate((surfaceSelector: string) => {
+    const state = { missingComposerFrames: 0, samples: 0, stopped: false }
+
+    ;(window as unknown as { __SESSION_SWITCH_LAYOUT__: typeof state }).__SESSION_SWITCH_LAYOUT__ = state
+
+    const sample = () => {
+      if (state.stopped) {
+        return
+      }
+
+      const surfaces = document.querySelectorAll(surfaceSelector)
+      const active = surfaces[surfaces.length - 1]
+
+      state.samples += 1
+
+      if (!active?.querySelector('[data-slot="composer-root"]')) {
+        state.missingComposerFrames += 1
+      }
+
+      requestAnimationFrame(sample)
+    }
+
+    requestAnimationFrame(sample)
+  }, SURFACE)
+
+  await sessionRow.click()
+  await waitForActiveTranscriptText(page, FIRST_USER_MSG)
+  await page.waitForTimeout(250)
+
+  const result = await page.evaluate(() => {
+    const state = (window as unknown as {
+      __SESSION_SWITCH_LAYOUT__?: { missingComposerFrames: number; samples: number; stopped: boolean }
+    }).__SESSION_SWITCH_LAYOUT__
+
+    if (state) {
+      state.stopped = true
+    }
+
+    return state
+  })
+
+  // The transcript paints before session activation and reconciliation finish.
+  // Keep teardown from racing that in-flight resume.
+  await page.waitForTimeout(2_000)
+
+  expect(result?.samples).toBeGreaterThan(0)
+  expect(result?.missingComposerFrames, 'The composer must keep its footprint during a session switch').toBe(0)
+})
+
 test('warm-route resume after background inference completes (no jitter)', async ({}, testInfo) => {
   test.fixme(
     true,
