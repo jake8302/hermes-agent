@@ -11781,9 +11781,10 @@ def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
         )
 
 
-_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+_AGENT_COMMANDS = {None, "chat", "acp", "rl", "serve"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
+    "dashboard": ("dashboard_subcommand", {None}),
     "gateway": ("gateway_command", {"run"}),
     "mcp": ("mcp_action", {"serve"}),
 }
@@ -11794,7 +11795,7 @@ def _is_tui_chat_launch(args) -> bool:
 
 
 def _command_has_dedicated_mcp_startup(args) -> bool:
-    if args.command == "acp":
+    if args.command in {"acp", "dashboard", "serve"}:
         return True
     if args.command == "gateway" and getattr(args, "gateway_command", None) == "run":
         return True
@@ -11821,6 +11822,11 @@ def _prepare_agent_startup(args) -> None:
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
+
+    if args.command == "dashboard" and (
+        getattr(args, "status", False) or getattr(args, "stop", False)
+    ):
+        return
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
