@@ -45,6 +45,84 @@ def _agent_args(**overrides) -> Namespace:
     return Namespace(**base)
 
 
+def _install_agent_startup_spies(monkeypatch):
+    calls = {"hooks": [], "mcp": 0, "plugins": 0}
+    config = {"hooks": {"pre_tool_call": [{"command": "/tmp/block.sh"}]}}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(
+            start_background_plugin_discovery=lambda: calls.__setitem__(
+                "plugins", calls["plugins"] + 1
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(load_config=lambda: config),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=lambda: calls.__setitem__(
+                "mcp", calls["mcp"] + 1
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(
+            register_from_config=lambda cfg, *, accept_hooks: calls[
+                "hooks"
+            ].append((cfg, accept_hooks))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.outbound_webhooks",
+        types.SimpleNamespace(register_from_config=lambda _cfg: None),
+    )
+
+    return config, calls
+
+
+@pytest.mark.parametrize("command", ["serve", "dashboard"])
+def test_prepare_agent_startup_registers_shell_hooks_for_dashboard_servers(
+    command, monkeypatch
+):
+    config, calls = _install_agent_startup_spies(monkeypatch)
+
+    main_mod._prepare_agent_startup(
+        _agent_args(command=command, dashboard_subcommand=None)
+    )
+
+    assert calls["hooks"] == [(config, False)]
+
+
+@pytest.mark.parametrize("flag", ["status", "stop"])
+def test_dashboard_management_skips_agent_startup(flag, monkeypatch):
+    _config, calls = _install_agent_startup_spies(monkeypatch)
+
+    main_mod._prepare_agent_startup(
+        _agent_args(
+            command="dashboard",
+            dashboard_subcommand=None,
+            **{flag: True},
+        )
+    )
+
+    assert calls == {"hooks": [], "mcp": 0, "plugins": 0}
+
+
+@pytest.mark.parametrize("command", ["serve", "dashboard"])
+def test_dashboard_servers_use_their_dedicated_mcp_startup(command):
+    assert main_mod._command_has_dedicated_mcp_startup(_agent_args(command=command))
+
+
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     stop = threading.Event()
     calls = {"mcp": 0}
